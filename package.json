@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "demo:ring": "node scripts/ring-demo.js",
     "test": "node --test"
   },
   "engines": {
