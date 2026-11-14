@@ -4,8 +4,8 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 2 complete: a single node with TTL expiry.
-> Clustering, replication and failover come in later phases.
+> **Status:** 🚧 Phase 3 complete: a TTL-capable node and a consistent hash
+> ring. Clustering, replication and failover come in later phases.
 
 ## Why this project?
 
@@ -17,7 +17,7 @@ and rebalancing.
 
 - [x] A single cache node with GET / PUT / DELETE over HTTP
 - [x] TTL expiry (lazy + active) using absolute expiry timestamps
-- [ ] Consistent hashing with virtual nodes
+- [x] Consistent hash ring with virtual nodes
 - [ ] Independent cache nodes forming one logical cluster
 - [ ] Replication of every key to at least one more node
 - [ ] TTL honored consistently across replicas
@@ -28,7 +28,8 @@ and rebalancing.
 
 ## Tech stack
 
-Node.js 24 · node:http · node:test · Docker · Kubernetes · GitHub Actions
+Node.js 24 · node:http · node:crypto · node:test · Docker · Kubernetes ·
+GitHub Actions
 
 ## Getting started
 
@@ -65,31 +66,46 @@ positive number; `405` for an unsupported method; `404` for unknown paths.
 - A key with a TTL is returned with an `expiresAt` field (milliseconds since
   1970). Keys without a TTL have no `expiresAt` field.
 - A `PUT` without `ttl` on an existing key removes its old TTL.
-- Expiry is stored as an **absolute timestamp**, not "seconds left". When
-  replication arrives, every replica will copy the same timestamp so a key
-  dies at the same moment everywhere.
-- Expired keys are removed in two ways: **lazily** when someone reads them,
-  and **actively** by a sweeper that runs every second.
+- Expiry is stored as an **absolute timestamp**, not "seconds left", so
+  replicas can copy the same timestamp and a key dies at the same moment
+  everywhere.
+- Expired keys are removed **lazily** when read and **actively** by a
+  sweeper that runs every second.
 
-### Try it
+## Consistent hashing
+
+Keys are assigned to nodes with a consistent hash ring (`src/hash-ring.js`).
+
+- Keys and nodes are hashed onto a circle of 2^32 positions. A key belongs to
+  the first node found walking clockwise from the key's position.
+- Each node appears at 100 **virtual nodes**, which evens out the load.
+- `getNode(key)` returns the owner; `getNodes(key, n)` returns the first `n`
+  distinct nodes clockwise (primary first, then replica candidates).
+
+Why not `hash(key) % N`? Run the demo and compare:
 
 ```bash
-curl -X PUT localhost:3000/keys/session \
-  -H "Content-Type: application/json" -d '{"value":"abc","ttl":10}'
-curl localhost:3000/keys/session
-curl -X DELETE localhost:3000/keys/session
+npm run demo:ring
+```
+
+```
+Add node-d (consistent hashing):   26.0% of keys moved, all to the new node
+Going from 3 to 4 nodes with % N:  75.8% of keys moved
 ```
 
 ## Project structure
 
 ```
 src/
-  store.js     in-memory key-value store with TTL (wraps a Map)
-  expiry.js    background sweeper that removes expired keys
-  server.js    HTTP layer on top of the store
-  index.js     starts a node
-test/          tests using the built-in node:test runner
-.nvmrc         Node version used for development
+  store.js       in-memory key-value store with TTL (wraps a Map)
+  expiry.js      background sweeper that removes expired keys
+  hash-ring.js   consistent hash ring with virtual nodes
+  server.js      HTTP layer on top of the store
+  index.js       starts a node
+scripts/
+  ring-demo.js   prints how keys spread and move on the ring
+test/            tests using the built-in node:test runner
+.nvmrc           Node version used for development
 ```
 
 ## Running tests
@@ -105,11 +121,12 @@ npm test
 | 0     | 1         | 1     |
 | 1     | 11        | 12    |
 | 2     | 12        | 24    |
+| 3     | 11        | 35    |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 3 adds the consistent
-hash ring.
+Each phase is delivered as one pull request. Phase 4 connects several nodes
+into a cluster and routes each request to the right node.
 
 ## License
 
