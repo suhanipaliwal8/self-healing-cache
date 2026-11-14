@@ -44,10 +44,15 @@ export function createServer(store) {
       }
 
       if (req.method === 'GET') {
-        if (!store.has(key)) {
+        const entry = store.getEntry(key);
+        if (!entry) {
           return sendJson(res, 404, { error: 'key not found' });
         }
-        return sendJson(res, 200, { key, value: store.get(key) });
+        const body = { key, value: entry.value };
+        if (entry.expiresAt !== null) {
+          body.expiresAt = entry.expiresAt;
+        }
+        return sendJson(res, 200, body);
       }
 
       if (req.method === 'PUT') {
@@ -60,7 +65,15 @@ export function createServer(store) {
         if (parsed === null || typeof parsed !== 'object' || !('value' in parsed)) {
           return sendJson(res, 400, { error: 'body must look like {"value": ...}' });
         }
-        store.set(key, parsed.value);
+        let ttlMs;
+        if ('ttl' in parsed) {
+          const ttl = parsed.ttl;
+          if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl <= 0) {
+            return sendJson(res, 400, { error: '"ttl" must be a positive number of seconds' });
+          }
+          ttlMs = ttl * 1000;
+        }
+        store.set(key, parsed.value, { ttlMs });
         return sendJson(res, 200, { ok: true });
       }
 
