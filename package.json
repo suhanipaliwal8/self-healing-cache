@@ -4,6 +4,7 @@
   "description": "A sharded, replicated, self-healing distributed cache",
   "type": "module",
   "scripts": {
+    "start": "node src/index.js",
     "test": "node --test"
   },
   "engines": {
