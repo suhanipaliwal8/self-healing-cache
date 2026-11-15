@@ -29,6 +29,16 @@ export class Cluster {
     return { id, url: this.#urls.get(id), isSelf: id === this.selfId };
   }
 
+  // The first `count` distinct nodes for a key: [primary, replica, ...].
+  // Each one is { id, url, isSelf }. The first is the same node ownerOf() gives.
+  ownersOf(key, count = 1) {
+    return this.#ring.getNodes(key, count).map((id) => ({
+      id,
+      url: this.#urls.get(id),
+      isSelf: id === this.selfId,
+    }));
+  }
+
   get nodes() {
     return [...this.#urls].map(([id, url]) => ({ id, url }));
   }
