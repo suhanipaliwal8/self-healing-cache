@@ -50,3 +50,39 @@ test('cluster: ownersOf never returns more nodes than exist', () => {
   assert.equal(cluster.ownersOf('k', 10).length, 3);
   assert.deepEqual(new Cluster({ selfId: 'x' }).ownersOf('k', 2), []);
 });
+
+
+test('cluster: markDown and markUp change isUp, but we never mark ourselves down', () => {
+  const cluster = makeCluster('node-a');
+  assert.equal(cluster.isUp('node-b'), true);
+
+  cluster.markDown('node-b');
+  assert.equal(cluster.isUp('node-b'), false);
+  cluster.markUp('node-b');
+  assert.equal(cluster.isUp('node-b'), true);
+
+  cluster.markDown('node-a'); // ourselves: ignored
+  cluster.markDown('ghost'); // unknown node: ignored
+  assert.equal(cluster.isUp('node-a'), true);
+  assert.equal(cluster.isUp('ghost'), true);
+});
+
+test('cluster: a down node stays on the ring, so key owners do not change', () => {
+  const cluster = makeCluster('node-a');
+  const before = Array.from({ length: 300 }, (_, i) => cluster.ownersOf(`key-${i}`, 2).map((o) => o.id));
+  cluster.markDown('node-b');
+  const after = Array.from({ length: 300 }, (_, i) => cluster.ownersOf(`key-${i}`, 2).map((o) => o.id));
+  assert.deepEqual(after, before);
+});
+
+test('cluster: nodes and ownersOf report who is up or down', () => {
+  const cluster = makeCluster('node-a');
+  cluster.markDown('node-c');
+
+  const status = Object.fromEntries(cluster.nodes.map((n) => [n.id, n.status]));
+  assert.deepEqual(status, { 'node-a': 'up', 'node-b': 'up', 'node-c': 'down' });
+
+  const flags = cluster.ownersOf('anything', 3).map((o) => [o.id, o.isUp]);
+  assert.deepEqual(flags.find(([id]) => id === 'node-c'), ['node-c', false]);
+  assert.deepEqual(flags.find(([id]) => id === 'node-b'), ['node-b', true]);
+});
