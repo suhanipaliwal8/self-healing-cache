@@ -22,6 +22,24 @@ export function parseCluster(text) {
     });
 }
 
+// Replication settings from environment variables.
+//   REPLICATION_FACTOR  total copies of every key, primary included (default 2)
+//   REPLICATION_MODE    "sync" waits for replicas, "async" does not (default sync)
+export function loadReplicationConfig(env = process.env) {
+  const factorText = env.REPLICATION_FACTOR ?? '2';
+  const replicationFactor = Number(factorText);
+  if (!Number.isInteger(replicationFactor) || replicationFactor < 1) {
+    throw new Error(`REPLICATION_FACTOR must be a whole number >= 1, got "${factorText}"`);
+  }
+
+  const replicationMode = env.REPLICATION_MODE ?? 'sync';
+  if (replicationMode !== 'sync' && replicationMode !== 'async') {
+    throw new Error(`REPLICATION_MODE must be "sync" or "async", got "${replicationMode}"`);
+  }
+
+  return { replicationFactor, replicationMode };
+}
+
 // Read settings from environment variables.
 //   NODE_ID  who this node is (must appear in CLUSTER)
 //   CLUSTER  every node in the cluster, as id=url pairs
