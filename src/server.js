@@ -97,8 +97,11 @@ export function createServer(
   }
 
   // Ask the primary first. If it cannot be reached, try the replicas in order.
+  // Nodes the failure detector believes are down go to the back of the line:
+  // we only try them if everyone else failed, so a wrong guess never causes an outage.
   async function readFromOwners(res, key, owners) {
-    for (const owner of owners) {
+    const ordered = [...owners.filter((o) => o.isUp), ...owners.filter((o) => !o.isUp)];
+    for (const owner of ordered) {
       if (owner.isSelf) return readLocal(res, key);
       try {
         return relay(res, await callNode(owner, 'GET', keyPath(key)));
@@ -112,7 +115,11 @@ export function createServer(
   // ---------- writes ----------
 
   // Writes always go to the primary. (Phase 7 adds failover for writes.)
+  // If the primary is known to be down we fail at once instead of waiting.
   async function writeViaPrimary(res, primary, method, key, rawBody) {
+    if (!primary.isUp) {
+      return sendJson(res, 502, { error: `${primary.id} is down` });
+    }
     try {
       return relay(res, await callNode(primary, method, keyPath(key), rawBody));
     } catch {
@@ -147,7 +154,15 @@ export function createServer(
   async function replicate(key, method, payload) {
     const targets = replicaTargets(key);
     if (targets.length === 0) return {};
-    const job = sendToReplicas(targets, method, key, payload);
+
+    // Never wait for a replica we believe is down. We still send it the change
+    // in the background, so it catches up if it turns out to be fine.
+    const suspected = targets.filter((node) => !node.isUp);
+    const live = targets.filter((node) => node.isUp);
+    if (suspected.length > 0) void sendToReplicas(suspected, method, key, payload);
+    if (live.length === 0) return {};
+
+    const job = sendToReplicas(live, method, key, payload);
     if (replicationMode === 'async') return {}; // do not wait for the replicas
     const acked = await job;
     return acked.length > 0 ? { 'x-replicated-to': acked.join(',') } : {};

@@ -40,6 +40,28 @@ export function loadReplicationConfig(env = process.env) {
   return { replicationFactor, replicationMode };
 }
 
+function positiveInteger(env, name, fallback) {
+  const text = env[name];
+  if (text === undefined) return fallback;
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a whole number >= 1, got "${text}"`);
+  }
+  return value;
+}
+
+// Heartbeat settings from environment variables.
+//   HEARTBEAT_INTERVAL_MS  how often to ping every other node (default 1000)
+//   HEARTBEAT_TIMEOUT_MS   how long to wait for one answer (default 500)
+//   FAILURE_THRESHOLD      failed pings in a row before "down" (default 3)
+export function loadFailureDetectorConfig(env = process.env) {
+  return {
+    intervalMs: positiveInteger(env, 'HEARTBEAT_INTERVAL_MS', 1000),
+    timeoutMs: positiveInteger(env, 'HEARTBEAT_TIMEOUT_MS', 500),
+    failureThreshold: positiveInteger(env, 'FAILURE_THRESHOLD', 3),
+  };
+}
+
 // Read settings from environment variables.
 //   NODE_ID  who this node is (must appear in CLUSTER)
 //   CLUSTER  every node in the cluster, as id=url pairs
