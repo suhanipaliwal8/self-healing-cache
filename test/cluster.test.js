@@ -31,3 +31,22 @@ test('cluster: every node computes the same owner for every key', () => {
     assert.equal(b.ownerOf(key).id, c.ownerOf(key).id);
   }
 });
+
+
+test('cluster: ownersOf returns distinct nodes and starts with the owner', () => {
+  const cluster = makeCluster('node-a');
+  for (let i = 0; i < 300; i++) {
+    const key = `key-${i}`;
+    const owners = cluster.ownersOf(key, 2);
+    assert.equal(owners.length, 2);
+    assert.notEqual(owners[0].id, owners[1].id);
+    assert.equal(owners[0].id, cluster.ownerOf(key).id);
+    assert.equal(owners[1].isSelf, owners[1].id === 'node-a');
+  }
+});
+
+test('cluster: ownersOf never returns more nodes than exist', () => {
+  const cluster = makeCluster('node-a');
+  assert.equal(cluster.ownersOf('k', 10).length, 3);
+  assert.deepEqual(new Cluster({ selfId: 'x' }).ownersOf('k', 2), []);
+});
