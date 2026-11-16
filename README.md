@@ -1,14 +1,14 @@
 # Self-Healing Distributed Cache
 
-[![CI](https://github.com/<your-username>/self-healing-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/self-healing-cache/actions/workflows/ci.yml)
+[![CI](https://github.com/suhanipaliwal8/self-healing-cache/actions/workflows/ci.yml/badge.svg)](https://github.com/suhanipaliwal8/self-healing-cache/actions/workflows/ci.yml)
 
 A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 6 complete: nodes watch each other with heartbeats and
-> stop waiting for dead peers. Write failover and rebalancing come in later
-> phases.
+> **Status:** 🚧 Phase 7 complete: writes fail over to a replica when the
+> primary is down, and a client with a retry policy survives a node dying
+> mid-traffic. Rebalancing when nodes return or join comes next.
 
 ## Why this project?
 
@@ -25,9 +25,9 @@ and rebalancing.
 - [x] Replication of every key to at least one more node
 - [x] TTL honored consistently across replicas
 - [x] Automatic failure detection (heartbeat)
-- [ ] Automatic failover for writes, with client retry
+- [x] Automatic failover for writes, with client retry
 - [ ] Automatic rebalancing when nodes join or return
-- [ ] Live "kill a node" demo with zero failed requests
+- [ ] Live "kill a node" demo with zero failed requests (full chaos test)
 - [ ] Stretch: LRU eviction, quorum reads/writes
 
 ## Tech stack
@@ -41,7 +41,7 @@ Requires Node.js 24 (developed on v24.11.0, see `.nvmrc`). No dependencies
 to install.
 
 ```bash
-git clone https://github.com/<your-username>/self-healing-cache.git
+git clone https://github.com/suhanipaliwal8/self-healing-cache.git
 cd self-healing-cache
 ```
 
@@ -82,8 +82,39 @@ curl -i localhost:3002/keys/user:1     # works from any node
 curl localhost:3001/cluster            # which nodes are up or down
 ```
 
-Type `kill node-c`, wait about 4 seconds and check `/cluster` again: `node-c`
-is `down` and reads are served by the replica (`x-served-by: node-b`).
+Now type `kill node-c` and write again. The replica takes over:
+
+```
+x-served-by: node-b
+x-failed-over-from: node-c
+```
+
+### Use the client in code
+
+`CacheClient` spreads requests over all nodes and retries on the next node
+when one does not answer.
+
+```js
+import { CacheClient } from './src/client.js';
+
+const client = new CacheClient({
+  nodes: ['http://localhost:3001', 'http://localhost:3002', 'http://localhost:3003'],
+  retries: 1, // extra attempts after the first one (default 1)
+});
+
+await client.set('user:1', { name: 'alice' }, { ttl: 60 });
+const hit = await client.get('user:1'); // { value, expiresAt } or undefined
+await client.delete('user:1'); // true if the key existed
+console.log(client.stats); // { requests, retries, failures }
+```
+
+Try it while breaking things. Start a cluster, run the demo, and type
+`kill node-c` in the cluster terminal:
+
+```bash
+npm run demo:client -- 20
+RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
+```
 
 ### Configuration (environment variables)
 
@@ -110,13 +141,14 @@ is `down` and reads are served by the replica (`x-served-by: node-b`).
 
 Errors: `400` for invalid JSON, a missing `value`, or a `ttl` that is not a
 positive number; `405` for an unsupported method; `404` for unknown paths;
-`502` when no node holding the key can be reached (or, for a write, when the
-primary is down or unreachable).
+`502` when no node holding the key can be reached.
 
 Response headers in cluster mode:
 
 - `x-served-by`: the node that actually handled the request.
 - `x-replicated-to`: (sync mode, writes) the replicas that confirmed their copy.
+- `x-failed-over-from`: (writes) the primary that was skipped because a
+  replica took over.
 
 Nodes also expose `PUT` / `DELETE` on `/internal/keys/:key`. These are used
 only by nodes to copy data to each other, not by clients.
@@ -190,10 +222,31 @@ Going from 3 to 4 nodes with % N:  75.8% of keys moved
   node hiccups. We only stop waiting for it.
 - Nodes believed to be down are tried **last**, not never, so a wrong
   suspicion cannot cause an outage.
-- Writes to a primary that is marked down fail immediately (`502`), and sync
-  replication does not wait for a replica that is marked down.
 - Each node keeps its own opinion about who is up. There is no central
   monitor that could fail.
+
+### Write failover
+
+- Writes go to the key's owners in order: the primary first, nodes believed
+  down last. If the primary cannot be reached, the next owner **takes over as
+  acting primary**: it stores the write and copies it to the other owners.
+  The response says so with `x-failed-over-from`.
+- When a request has to wait on several nodes in a row, timeouts can collide.
+  The coordinator therefore tells the node taking over which nodes it could
+  not reach (`x-cache-unreachable`), so that node does not wait for them again.
+- With replication factor 1 there is nothing to fail over to, so the write
+  returns `502`.
+
+### Client retries
+
+- `CacheClient` rotates over all nodes (round robin). If a node does not
+  answer, times out, or returns `502`, `503` or `504`, the client retries on
+  the **next node** (default: 1 retry, 5 second timeout).
+- `404` and `400` are real answers and are never retried.
+- Retrying is safe because `GET`, `PUT` and `DELETE` are idempotent: doing
+  them twice leaves the cache in the same state.
+- In the live demo, with one node killed mid-run: 220 requests, 75 retries,
+  0 failed requests, 0 wrong values. With retries off, 24 of 72 requests failed.
 
 ### Data lives in memory only
 
@@ -204,8 +257,9 @@ Safety comes from the copies on other nodes, not from disk.
 
 | Limitation | Fixed in |
 |------------|----------|
-| A write to a key whose primary is down returns `502` | Phase 7 |
 | A node that comes back is empty and answers `404` for keys it should own | Phase 8 |
+| After a failover the primary and the replica can hold different values, and a node cut off from the network can come back with old values | Phase 8 |
+| Keys are not moved when a node joins the cluster (membership is a fixed list) | Phase 8 |
 
 ## Project structure
 
@@ -217,13 +271,15 @@ src/
   cluster.js            one node's view: key owners, replicas, who is up
   failure-detector.js   heartbeat pings that mark nodes up or down
   config.js             reads NODE_ID / CLUSTER / PORT / replication / heartbeat settings
-  server.js             HTTP layer: forwarding, replication, read fallback
+  server.js             HTTP layer: forwarding, replication, failover
+  client.js             CacheClient: round robin and retries
   index.js              starts a node
 scripts/
-  ring-demo.js     prints how keys spread and move on the ring
-  dev-cluster.js   starts several nodes locally; kill / start / freeze / thaw
-test/              tests using the built-in node:test runner
-.nvmrc             Node version used for development
+  ring-demo.js      prints how keys spread and move on the ring
+  dev-cluster.js    starts several nodes locally; kill / start / freeze / thaw
+  client-demo.js    writes and reads keys while you break nodes
+test/               tests using the built-in node:test runner
+.nvmrc              Node version used for development
 ```
 
 ## Running tests
@@ -243,11 +299,12 @@ npm test
 | 4     | 18        | 53    |
 | 5     | 17        | 70    |
 | 6     | 20        | 90    |
+| 7     | 16 (1 replaced) | 105 |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 7 adds automatic failover
-for writes and a client retry policy.
+Each phase is delivered as one pull request. Phase 8 adds rebalancing:
+a node that returns, or a new node that joins, gets its keys automatically.
 
 ## License
 

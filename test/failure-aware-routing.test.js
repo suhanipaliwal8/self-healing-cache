@@ -110,20 +110,6 @@ test('routing: a read no longer waits for a frozen primary once it is marked dow
   assert.ok(fast.ms < 200, `expected an instant answer, took ${fast.ms}ms`);
 });
 
-test('routing: a write to a primary that is marked down fails at once with 502', async (t) => {
-  const c = await startCluster();
-  t.after(() => c.stopAll());
-
-  const key = 'user:1';
-  const [primary] = c.owners(key);
-  const coordinator = c.ids.find((id) => id !== primary);
-  c.cluster(coordinator).markDown(primary);
-
-  const res = await call(c, coordinator, key, { method: 'PUT', body: { value: 'x' } });
-  assert.equal(res.status, 502);
-  assert.match((await res.json()).error, /is down/);
-});
-
 test('routing: sync replication does not wait for a replica marked down', async (t) => {
   const c = await startCluster({ frozen: ['node-c'] });
   t.after(() => c.stopAll());

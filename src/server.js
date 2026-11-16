@@ -17,13 +17,21 @@ function decodeKey(raw) {
   }
 }
 
+// Nodes we believe are up first; nodes the failure detector believes are down
+// go to the back of the line. We only try them if everyone else failed, so a
+// wrong guess by the detector never causes an outage.
+function tryOrder(owners) {
+  return [...owners.filter((o) => o.isUp), ...owners.filter((o) => !o.isUp)];
+}
+
 // Build (but do not start) an HTTP server that exposes a Store.
 //
 // Without a cluster it behaves like a single node.
-// With a cluster, any node can receive any request: it is forwarded to the
-// key's primary node. The primary stores the key and copies it to
-// (replicationFactor - 1) replica nodes. Reads fall back to a replica when the
-// primary cannot be reached.
+// With a cluster, any node can receive any request: it is sent to the key's
+// primary node. The primary stores the key and copies it to
+// (replicationFactor - 1) replica nodes. If the primary cannot be reached,
+// reads are answered by a replica and writes FAIL OVER to the next replica,
+// which takes over as "acting primary".
 export function createServer(
   store,
   { cluster, forwardTimeoutMs = 2000, replicationFactor = 1, replicationMode = 'sync' } = {},
@@ -47,12 +55,13 @@ export function createServer(
   // Call another node. Resolves with its answer, or THROWS if the node cannot
   // be reached (connection refused, timeout, ...). An HTTP error status such
   // as 404 is still an answer and does not throw.
-  async function callNode(node, method, path, rawBody) {
+  async function callNode(node, method, path, rawBody, extraHeaders = {}) {
     const response = await fetch(`${node.url}${path}`, {
       method,
       headers: {
         'Content-Type': 'application/json',
         'x-cache-forwarded-by': cluster.selfId,
+        ...extraHeaders,
       },
       body: rawBody,
       signal: AbortSignal.timeout(forwardTimeoutMs), // never wait forever
@@ -66,11 +75,12 @@ export function createServer(
   }
 
   // Pass another node's answer straight back to our client.
-  function relay(res, result) {
+  function relay(res, result, extraHeaders = {}) {
     const headers = {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(result.text),
       'x-served-by': result.servedBy,
+      ...extraHeaders,
     };
     if (result.replicatedTo) headers['x-replicated-to'] = result.replicatedTo;
     res.writeHead(result.status, headers);
@@ -97,11 +107,8 @@ export function createServer(
   }
 
   // Ask the primary first. If it cannot be reached, try the replicas in order.
-  // Nodes the failure detector believes are down go to the back of the line:
-  // we only try them if everyone else failed, so a wrong guess never causes an outage.
   async function readFromOwners(res, key, owners) {
-    const ordered = [...owners.filter((o) => o.isUp), ...owners.filter((o) => !o.isUp)];
-    for (const owner of ordered) {
+    for (const owner of tryOrder(owners)) {
       if (owner.isSelf) return readLocal(res, key);
       try {
         return relay(res, await callNode(owner, 'GET', keyPath(key)));
@@ -113,19 +120,6 @@ export function createServer(
   }
 
   // ---------- writes ----------
-
-  // Writes always go to the primary. (Phase 7 adds failover for writes.)
-  // If the primary is known to be down we fail at once instead of waiting.
-  async function writeViaPrimary(res, primary, method, key, rawBody) {
-    if (!primary.isUp) {
-      return sendJson(res, 502, { error: `${primary.id} is down` });
-    }
-    try {
-      return relay(res, await callNode(primary, method, keyPath(key), rawBody));
-    } catch {
-      return sendJson(res, 502, { error: `${primary.id} is unreachable` });
-    }
-  }
 
   // The other nodes that should hold a copy of this key (empty if we are not
   // one of the key's owners, or if replication is off).
@@ -151,14 +145,17 @@ export function createServer(
   }
 
   // Copy a change to the replicas. Returns extra response headers.
-  async function replicate(key, method, payload) {
+  // `unreachable` = ids that the node who sent us this request already failed
+  // to reach: we must not wait for them again.
+  async function replicate(key, method, payload, unreachable = new Set()) {
     const targets = replicaTargets(key);
     if (targets.length === 0) return {};
 
     // Never wait for a replica we believe is down. We still send it the change
     // in the background, so it catches up if it turns out to be fine.
-    const suspected = targets.filter((node) => !node.isUp);
-    const live = targets.filter((node) => node.isUp);
+    const isSuspected = (node) => !node.isUp || unreachable.has(node.id);
+    const suspected = targets.filter(isSuspected);
+    const live = targets.filter((node) => !isSuspected(node));
     if (suspected.length > 0) void sendToReplicas(suspected, method, key, payload);
     if (live.length === 0) return {};
 
@@ -166,6 +163,47 @@ export function createServer(
     if (replicationMode === 'async') return {}; // do not wait for the replicas
     const acked = await job;
     return acked.length > 0 ? { 'x-replicated-to': acked.join(',') } : {};
+  }
+
+  // Store a key on THIS node, then copy it to the other owners. This is what
+  // the primary does, and also what a replica does when it takes over.
+  async function applyPut(res, key, value, ttlMs, extraHeaders = {}, unreachable = new Set()) {
+    store.set(key, value, { ttlMs });
+    // Replicas receive the ABSOLUTE expiry time, so the key dies at the same
+    // moment on every copy.
+    const entry = store.getEntry(key);
+    const headers = entry
+      ? await replicate(key, 'PUT', { value: entry.value, expiresAt: entry.expiresAt }, unreachable)
+      : {};
+    return sendJson(res, 200, { ok: true }, { ...extraHeaders, ...headers });
+  }
+
+  async function applyDelete(res, key, extraHeaders = {}, unreachable = new Set()) {
+    const deleted = store.delete(key);
+    const headers = await replicate(key, 'DELETE', undefined, unreachable);
+    return sendJson(res, 200, { deleted }, { ...extraHeaders, ...headers });
+  }
+
+  // Send a write to the key's owners, primary first. If the primary cannot be
+  // reached, the next owner takes over (FAILOVER) and copies the write to the
+  // others. `applyLocal` is what to do when we ourselves are the owner chosen.
+  async function writeViaOwners(res, owners, method, key, rawBody, applyLocal) {
+    const primary = owners[0];
+    const failed = new Set(); // owners we could not reach during this request
+    for (const owner of tryOrder(owners)) {
+      // Tell the client when someone other than the primary served the write.
+      const extra = owner.id === primary.id ? {} : { 'x-failed-over-from': primary.id };
+      if (owner.isSelf) return applyLocal(extra, failed);
+      try {
+        // Pass on what we learned, so the node taking over does not waste a
+        // whole timeout waiting for a node we already know is unreachable.
+        const hint = failed.size > 0 ? { 'x-cache-unreachable': [...failed].join(',') } : {};
+        return relay(res, await callNode(owner, method, keyPath(key), rawBody, hint), extra);
+      } catch {
+        failed.add(owner.id); // could not reach this owner: let the next one take over
+      }
+    }
+    return sendJson(res, 502, { error: unreachableMessage(owners) });
   }
 
   return http.createServer(async (req, res) => {
@@ -233,7 +271,10 @@ export function createServer(
       // bounce it around forever.
       const alreadyForwarded = req.headers['x-cache-forwarded-by'] !== undefined;
       const owners = cluster && !alreadyForwarded ? cluster.ownersOf(key, replicationFactor) : [];
-      const primaryIsRemote = owners.length > 0 && !owners[0].isSelf;
+      // Nodes the sender of a forwarded request could not reach (see writeViaOwners).
+      const reportedUnreachable = new Set(
+        (req.headers['x-cache-unreachable'] ?? '').split(',').filter(Boolean),
+      );
 
       if (req.method === 'GET') {
         if (owners.length === 0) return readLocal(res, key);
@@ -259,27 +300,18 @@ export function createServer(
           }
           ttlMs = ttl * 1000;
         }
-        // Bad requests are rejected above, before any forwarding happens.
-        if (primaryIsRemote) {
-          return writeViaPrimary(res, owners[0], 'PUT', key, rawBody);
-        }
-        store.set(key, parsed.value, { ttlMs });
-        // Replicas receive the ABSOLUTE expiry time, so the key dies at the
-        // same moment on every copy.
-        const entry = store.getEntry(key);
-        const headers = entry
-          ? await replicate(key, 'PUT', { value: entry.value, expiresAt: entry.expiresAt })
-          : {};
-        return sendJson(res, 200, { ok: true }, headers);
+        // Bad requests are rejected above, before anything is forwarded.
+        const applyLocal = (extra = {}, failed = reportedUnreachable) =>
+          applyPut(res, key, parsed.value, ttlMs, extra, failed);
+        if (owners.length === 0) return applyLocal();
+        return writeViaOwners(res, owners, 'PUT', key, rawBody, applyLocal);
       }
 
       if (req.method === 'DELETE') {
-        if (primaryIsRemote) {
-          return writeViaPrimary(res, owners[0], 'DELETE', key);
-        }
-        const deleted = store.delete(key);
-        const headers = await replicate(key, 'DELETE');
-        return sendJson(res, 200, { deleted }, headers);
+        const applyLocal = (extra = {}, failed = reportedUnreachable) =>
+          applyDelete(res, key, extra, failed);
+        if (owners.length === 0) return applyLocal();
+        return writeViaOwners(res, owners, 'DELETE', key, undefined, applyLocal);
       }
 
       return sendJson(res, 405, { error: 'method not allowed' });
