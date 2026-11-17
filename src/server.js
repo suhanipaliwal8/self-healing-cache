@@ -34,8 +34,17 @@ function tryOrder(owners) {
 // which takes over as "acting primary".
 export function createServer(
   store,
-  { cluster, forwardTimeoutMs = 2000, replicationFactor = 1, replicationMode = 'sync' } = {},
+  { cluster, forwardTimeoutMs = 2000, replicationFactor = 1, replicationMode = 'sync', rebalancer } = {},
 ) {
+  // Every write gets a VERSION: the time it happened, made to always go up on
+  // this node. When two copies disagree, the higher version wins.
+  let lastVersion = 0;
+  function nextVersion() {
+    lastVersion = Math.max(Date.now(), lastVersion + 1);
+    return lastVersion;
+  }
+  const writer = cluster ? cluster.selfId : 'local';
+
   // Send a JSON response. In a cluster we also say which node answered.
   function sendJson(res, status, body, extraHeaders = {}) {
     const payload = JSON.stringify(body);
@@ -106,16 +115,26 @@ export function createServer(
     return sendJson(res, 200, body);
   }
 
-  // Ask the primary first. If it cannot be reached, try the replicas in order.
+  // Ask the primary first. If it cannot be reached, OR it does not have the
+  // key (for example it just restarted and is still empty), try the replicas
+  // in order. Only if nobody has it do we answer 404.
   async function readFromOwners(res, key, owners) {
+    let firstMiss; // the first "I do not have it" answer, kept in case nobody has it
     for (const owner of tryOrder(owners)) {
-      if (owner.isSelf) return readLocal(res, key);
+      if (owner.isSelf) {
+        if (store.getEntry(key)) return readLocal(res, key);
+        firstMiss ??= { status: 404, text: JSON.stringify({ error: 'key not found' }), servedBy: cluster.selfId };
+        continue;
+      }
       try {
-        return relay(res, await callNode(owner, 'GET', keyPath(key)));
+        const result = await callNode(owner, 'GET', keyPath(key));
+        if (result.status !== 404) return relay(res, result);
+        firstMiss ??= result;
       } catch {
         // could not reach this copy: try the next one
       }
     }
+    if (firstMiss) return relay(res, firstMiss);
     return sendJson(res, 502, { error: unreachableMessage(owners) });
   }
 
@@ -168,19 +187,25 @@ export function createServer(
   // Store a key on THIS node, then copy it to the other owners. This is what
   // the primary does, and also what a replica does when it takes over.
   async function applyPut(res, key, value, ttlMs, extraHeaders = {}, unreachable = new Set()) {
-    store.set(key, value, { ttlMs });
+    store.set(key, value, { ttlMs, version: nextVersion(), writer });
     // Replicas receive the ABSOLUTE expiry time, so the key dies at the same
-    // moment on every copy.
-    const entry = store.getEntry(key);
-    const headers = entry
-      ? await replicate(key, 'PUT', { value: entry.value, expiresAt: entry.expiresAt }, unreachable)
+    // moment on every copy, and the VERSION, so every copy knows which write is newest.
+    const record = store.getRecord(key);
+    const headers = record
+      ? await replicate(
+          key,
+          'PUT',
+          { value: record.value, expiresAt: record.expiresAt, version: record.version, writer },
+          unreachable,
+        )
       : {};
     return sendJson(res, 200, { ok: true }, { ...extraHeaders, ...headers });
   }
 
   async function applyDelete(res, key, extraHeaders = {}, unreachable = new Set()) {
-    const deleted = store.delete(key);
-    const headers = await replicate(key, 'DELETE', undefined, unreachable);
+    const version = nextVersion();
+    const deleted = store.delete(key, { version, writer });
+    const headers = await replicate(key, 'DELETE', { version, writer }, unreachable);
     return sendJson(res, 200, { deleted }, { ...extraHeaders, ...headers });
   }
 
@@ -220,6 +245,80 @@ export function createServer(
         return sendJson(res, 200, { self: cluster.selfId, nodes: cluster.nodes });
       }
 
+      // Internal bulk endpoints, used by the Rebalancer (see src/rebalancer.js).
+      if (req.method === 'GET' && url.pathname === '/internal/digest') {
+        // Every key we hold (including tombstones) with its version, but no values.
+        const entries = [...store.records()].map(([key, r]) => ({
+          key,
+          version: r.version,
+          writer: r.writer,
+          deleted: r.deleted,
+        }));
+        return sendJson(res, 200, { entries });
+      }
+      if (req.method === 'POST' && url.pathname === '/internal/fetch') {
+        const { keys } = JSON.parse(await readBody(req));
+        const entries = [];
+        for (const key of keys) {
+          const record = store.getRecord(key);
+          if (record) entries.push({ key, ...record });
+        }
+        return sendJson(res, 200, { entries });
+      }
+      if (req.method === 'POST' && url.pathname === '/internal/entries') {
+        const { entries } = JSON.parse(await readBody(req));
+        let applied = 0;
+        for (const { key, ...record } of entries) if (store.applyRecord(key, record)) applied++;
+        return sendJson(res, 200, { applied });
+      }
+
+      // Membership: add or remove a node while the cluster is running.
+      const memberMatch = cluster && url.pathname.match(/^\/cluster\/nodes\/([^/]+)$/);
+      if (memberMatch && (req.method === 'PUT' || req.method === 'DELETE')) {
+        const id = decodeKey(memberMatch[1]);
+        if (id === undefined) return sendJson(res, 400, { error: 'invalid node id' });
+        // A change we receive from another node is applied but not passed on again.
+        const fromPeer = req.headers['x-cache-forwarded-by'] !== undefined;
+        const before = cluster.nodes;
+        const others = before.filter((n) => n.id !== cluster.selfId);
+
+        if (req.method === 'PUT') {
+          let parsed;
+          try {
+            parsed = JSON.parse(await readBody(req));
+          } catch {
+            return sendJson(res, 400, { error: 'body must be valid JSON' });
+          }
+          let nodeUrl;
+          try {
+            nodeUrl = new URL(parsed?.url).origin;
+          } catch {
+            return sendJson(res, 400, { error: 'body must look like {"url": "http://host:port"}' });
+          }
+          cluster.addNode(id, nodeUrl);
+          if (!fromPeer) {
+            // Tell everyone else, and tell the NEW node who is already in the cluster.
+            const news = { id, url: nodeUrl };
+            await Promise.allSettled([
+              ...others.filter((n) => n.id !== id).map((n) =>
+                callNode(n, 'PUT', `/cluster/nodes/${encodeURIComponent(id)}`, JSON.stringify({ url: nodeUrl }))),
+              ...before.filter((n) => n.id !== id).map((n) =>
+                callNode(news, 'PUT', `/cluster/nodes/${encodeURIComponent(n.id)}`, JSON.stringify({ url: n.url }))),
+            ]);
+          }
+        } else {
+          cluster.removeNode(id);
+          if (!fromPeer) {
+            // Tell everyone, including the node that is leaving (so it hands its keys over).
+            await Promise.allSettled(
+              others.map((n) => callNode(n, 'DELETE', `/cluster/nodes/${encodeURIComponent(id)}`)),
+            );
+          }
+        }
+        void rebalancer?.reconcile().catch(() => {}); // move keys in the background
+        return sendJson(res, 200, { ok: true, nodes: cluster.nodes });
+      }
+
       // Internal endpoint: other nodes use it to copy a key to us. It stores
       // exactly what it is given (including the absolute expiresAt) and never
       // forwards or replicates again.
@@ -246,10 +345,32 @@ export function createServer(
               error: 'body must look like {"value": ..., "expiresAt": number or null}',
             });
           }
+          if (Number.isFinite(parsed.version)) {
+            // Take it only if it is newer than what we hold.
+            const applied = store.applyRecord(key, {
+              value: parsed.value,
+              expiresAt: parsed.expiresAt,
+              version: parsed.version,
+              writer: parsed.writer ?? '',
+            });
+            return sendJson(res, 200, { ok: true, applied });
+          }
           store.set(key, parsed.value, { expiresAt: parsed.expiresAt });
-          return sendJson(res, 200, { ok: true });
+          return sendJson(res, 200, { ok: true, applied: true });
         }
         if (req.method === 'DELETE') {
+          const text = await readBody(req);
+          const parsed = text ? JSON.parse(text) : {};
+          if (Number.isFinite(parsed.version)) {
+            const existed = store.has(key);
+            const applied = store.applyRecord(key, {
+              deleted: true,
+              expiresAt: null,
+              version: parsed.version,
+              writer: parsed.writer ?? '',
+            });
+            return sendJson(res, 200, { deleted: applied && existed });
+          }
           return sendJson(res, 200, { deleted: store.delete(key) });
         }
         return sendJson(res, 405, { error: 'method not allowed' });

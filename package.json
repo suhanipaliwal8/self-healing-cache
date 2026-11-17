@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "cluster": "node scripts/dev-cluster.js",
     "demo:client": "node scripts/client-demo.js",
+    "demo:data": "node scripts/data-demo.js",
     "demo:ring": "node scripts/ring-demo.js",
     "test": "node --test"
   },

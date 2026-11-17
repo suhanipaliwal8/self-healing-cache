@@ -6,9 +6,10 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 7 complete: writes fail over to a replica when the
-> primary is down, and a client with a retry policy survives a node dying
-> mid-traffic. Rebalancing when nodes return or join comes next.
+> **Status:** 🚧 Phase 8 complete: every write has a version, copies repair
+> themselves, keys move automatically when a node joins or leaves, and a node
+> that comes back empty is refilled. The Docker, Kubernetes and chaos-demo
+> phases come next.
 
 ## Why this project?
 
@@ -26,7 +27,8 @@ and rebalancing.
 - [x] TTL honored consistently across replicas
 - [x] Automatic failure detection (heartbeat)
 - [x] Automatic failover for writes, with client retry
-- [ ] Automatic rebalancing when nodes join or return
+- [x] Automatic rebalancing when nodes join, leave or return
+- [ ] Docker image and Kubernetes (StatefulSet) deployment
 - [ ] Live "kill a node" demo with zero failed requests (full chaos test)
 - [ ] Stretch: LRU eviction, quorum reads/writes
 
@@ -65,9 +67,11 @@ While the cluster runs, type a command in the same terminal:
 |---------|--------|
 | `status` | Show which nodes are running, frozen or stopped |
 | `kill node-c` | Stop a node, like a crash |
-| `start node-c` | Start it again (it comes back with an empty memory) |
+| `start node-c` | Start it again (it comes back empty and refills from its peers) |
 | `freeze node-c` | Pause a node: it looks alive but answers nothing (Mac, Linux, WSL) |
 | `thaw node-c` | Resume a frozen node |
+| `join` | Start a NEW node (node-d, node-e, ...) and add it to the running cluster |
+| `leave node-c` | Remove a node from the cluster; it hands its keys to the others |
 
 Talk to **any** node. The node you ask forwards the request to the right
 node, and response headers tell you what happened:
@@ -88,6 +92,17 @@ Now type `kill node-c` and write again. The replica takes over:
 x-served-by: node-b
 x-failed-over-from: node-c
 ```
+
+### See your data move
+
+```bash
+npm run demo:data -- fill 300     # write 300 keys
+npm run demo:data -- where        # how many keys each node holds
+npm run demo:data -- check 300    # read them all back: 0 should be missing
+```
+
+Type `join`, `kill node-c` + `start node-c`, or `leave node-b` in the cluster
+terminal and run `where` and `check` again. Every key keeps both copies.
 
 ### Use the client in code
 
@@ -121,13 +136,14 @@ RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `NODE_ID` | This node's id, must appear in `CLUSTER` | `node-1` (single node) |
-| `CLUSTER` | Every node as `id=url` pairs, comma separated | none (single node) |
+| `CLUSTER` | Every node as `id=url` pairs, comma separated (a new node may list only itself and be added later) | none (single node) |
 | `PORT` | Port to listen on | port from this node's own URL, else 3000 |
 | `REPLICATION_FACTOR` | Total copies of every key, primary included | `2` |
 | `REPLICATION_MODE` | `sync` waits for replicas, `async` does not | `sync` |
 | `HEARTBEAT_INTERVAL_MS` | How often every other node is pinged | `1000` |
 | `HEARTBEAT_TIMEOUT_MS` | How long to wait for one ping answer | `500` |
 | `FAILURE_THRESHOLD` | Failed pings in a row before a node counts as down | `3` |
+| `ANTI_ENTROPY_INTERVAL_MS` | How often a node compares notes with every peer | `5000` |
 
 ## API
 
@@ -135,6 +151,8 @@ RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
 |--------|------|------|------------------|
 | `GET` | `/health` | none | `200 {"status":"ok"}` |
 | `GET` | `/cluster` | none | `200 {"self":"node-a","nodes":[{"id","url","status"}]}` (cluster mode only) |
+| `PUT` | `/cluster/nodes/:id` | `{"url": "http://host:port"}` | `200 {"ok":true,"nodes":[...]}` adds a node to the running cluster |
+| `DELETE` | `/cluster/nodes/:id` | none | `200 {"ok":true,"nodes":[...]}` removes a node |
 | `PUT` | `/keys/:key` | `{"value": <any JSON>, "ttl": <seconds, optional>}` | `200 {"ok":true}` |
 | `GET` | `/keys/:key` | none | `200 {"key":"...","value":...}` or `404` |
 | `DELETE` | `/keys/:key` | none | `200 {"deleted":true}` or `{"deleted":false}` |
@@ -150,8 +168,8 @@ Response headers in cluster mode:
 - `x-failed-over-from`: (writes) the primary that was skipped because a
   replica took over.
 
-Nodes also expose `PUT` / `DELETE` on `/internal/keys/:key`. These are used
-only by nodes to copy data to each other, not by clients.
+Nodes also expose `/internal/...` endpoints (copying keys, digests, bulk
+transfer). These are used only by nodes to talk to each other, not by clients.
 
 ### Expiry (TTL)
 
@@ -190,7 +208,7 @@ Going from 3 to 4 nodes with % N:  75.8% of keys moved
 
 ### Request routing
 
-- Every node builds the same ring from the same `CLUSTER` list, so all nodes
+- Every node builds the same ring from the same member list, so all nodes
   agree on who owns a key.
 - Any node accepts any request and forwards it to the right node (2 second
   timeout). A forwarded request carries `x-cache-forwarded-by` and is always
@@ -248,36 +266,78 @@ Going from 3 to 4 nodes with % N:  75.8% of keys moved
 - In the live demo, with one node killed mid-run: 220 requests, 75 retries,
   0 failed requests, 0 wrong values. With retries off, 24 of 72 requests failed.
 
+### Versions and tombstones
+
+- Every write gets a **version**: the time of the write (made to always
+  increase on one node). When two copies disagree, the **newest version wins**
+  ("last write wins"). Equal versions are settled by the writer's node id, so
+  every node picks the same winner.
+- Copies are applied only if they are newer than what the node has, so
+  copying the same record twice is harmless.
+- A delete leaves a **tombstone** (a record with a version). Without it, a node
+  that missed the delete would give the old value back to everyone.
+  Tombstones are cleaned up after 10 minutes.
+
+### Rebalancing and anti-entropy
+
+One routine, `reconcile()` (`src/rebalancer.js`), keeps the copies correct. It
+runs when membership changes (**rebalance**), when a node comes back or starts
+(**catch-up**), and every `ANTI_ENTROPY_INTERVAL_MS` (**anti-entropy**).
+
+- A node asks each peer for a **digest** (key + version, no values) and
+  compares. It **sends** what the peer should own but lacks or has older, and
+  **fetches** what it should own but lacks or has older.
+- Keys that no longer belong to a node are dropped only after **every** new
+  owner confirmed it holds them, so a rebalance cannot lose data.
+- A read that finds the key missing on the primary also asks the replicas, so
+  a node that just restarted empty does not cause false `404`s. A real miss
+  costs one extra hop.
+
+### Joining and leaving at runtime
+
+- `PUT /cluster/nodes/:id` adds a node: the node you call tells everyone else
+  and tells the new node who is already in the cluster. Everyone rebalances.
+- `DELETE /cluster/nodes/:id` removes a node: it hands its keys over (if it is
+  still alive) and the others restore full replication.
+- In the live demo with 300 keys: after a 4th node joined, after a node
+  restarted empty, and after a node left, 0 keys were missing and every key
+  still had 2 copies.
+
 ### Data lives in memory only
 
 Like Redis without persistence, a node that restarts comes back **empty**.
-Safety comes from the copies on other nodes, not from disk.
+Safety comes from the copies on other nodes, not from disk. When it returns,
+its peers refill it.
 
-## Known limitations (fixed in later phases)
+## Known limitations
 
-| Limitation | Fixed in |
-|------------|----------|
-| A node that comes back is empty and answers `404` for keys it should own | Phase 8 |
-| After a failover the primary and the replica can hold different values, and a node cut off from the network can come back with old values | Phase 8 |
-| Keys are not moved when a node joins the cluster (membership is a fixed list) | Phase 8 |
+| Limitation | Why |
+|------------|-----|
+| "Newest" depends on node clocks; if clocks are far apart an older write can win | Last write wins trusts the clock. Logical clocks fix this |
+| A node cut off from the network can return old values until it reconnects | The cache stays available instead of always fresh (AP). Quorum reads in Phase 13 |
+| A node that was down while membership changed does not know about the change | The member change is a one-time broadcast; Kubernetes (Phase 10) gives a stable member list |
+| A node down for longer than the tombstone lifetime (10 min) can bring back a deleted key | Tombstones are cleaned up |
+| Digests list every key | Fine at this size; large systems use Merkle trees |
 
 ## Project structure
 
 ```
 src/
-  store.js              in-memory key-value store with TTL (wraps a Map)
+  store.js              in-memory key-value store: TTL, versions, tombstones
   expiry.js             background sweeper that removes expired keys
   hash-ring.js          consistent hash ring with virtual nodes
   cluster.js            one node's view: key owners, replicas, who is up
   failure-detector.js   heartbeat pings that mark nodes up or down
+  rebalancer.js         moves keys, catches nodes up, anti-entropy
   config.js             reads NODE_ID / CLUSTER / PORT / replication / heartbeat settings
-  server.js             HTTP layer: forwarding, replication, failover
+  server.js             HTTP layer: forwarding, replication, failover, membership
   client.js             CacheClient: round robin and retries
   index.js              starts a node
 scripts/
   ring-demo.js      prints how keys spread and move on the ring
-  dev-cluster.js    starts several nodes locally; kill / start / freeze / thaw
+  dev-cluster.js    starts several nodes locally; kill / start / freeze / thaw / join / leave
   client-demo.js    writes and reads keys while you break nodes
+  data-demo.js      fill / check / where: see your data move
 test/               tests using the built-in node:test runner
 .nvmrc              Node version used for development
 ```
@@ -300,11 +360,12 @@ npm test
 | 5     | 17        | 70    |
 | 6     | 20        | 90    |
 | 7     | 16 (1 replaced) | 105 |
+| 8     | 26        | 131   |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 8 adds rebalancing:
-a node that returns, or a new node that joins, gets its keys automatically.
+Each phase is delivered as one pull request. Phase 9 puts the node into a
+Docker image, and Phase 10 runs the cluster on Kubernetes.
 
 ## License
 
