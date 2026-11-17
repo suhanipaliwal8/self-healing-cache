@@ -1,21 +1,36 @@
-name: CI
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-
-jobs:
-  test:
+  docker:
     runs-on: ubuntu-latest
     steps:
-      - name: Get the code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
+      - name: Build the image and start the 3-node cluster
+        run: docker compose up -d --build
 
-      - name: Run tests
-        run: npm test
+      - name: Wait until every node answers
+        run: |
+          for port in 3001 3002 3003; do
+            for i in $(seq 1 30); do
+              if curl -fs http://localhost:$port/health > /dev/null; then break; fi
+              sleep 1
+            done
+            curl -fs http://localhost:$port/health
+          done
+
+      - name: Write on one node, read from another
+        run: |
+          curl -fsS -X PUT localhost:3001/keys/ci -H "Content-Type: application/json" -d '{"value":"hello"}'
+          curl -fsS localhost:3003/keys/ci | grep hello
+
+      - name: Stop a node, the key must still be readable
+        run: |
+          docker compose stop node-c
+          curl -fsS localhost:3001/keys/ci | grep hello
+          curl -fsS localhost:3002/keys/ci | grep hello
+
+      - name: Show logs if something failed
+        if: failure()
+        run: docker compose logs
+
+      - name: Clean up
+        if: always()
+        run: docker compose down
