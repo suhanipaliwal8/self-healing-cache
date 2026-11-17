@@ -1,0 +1,35 @@
+# A 3-node cluster in containers:   docker compose up --build
+# Inside Docker the nodes find each other by service name (node-a, node-b, ...).
+# From your machine you reach them on ports 3001, 3002 and 3003.
+
+x-node: &node
+  build: .
+  image: self-healing-cache:dev
+  environment: &env
+    CLUSTER: node-a=http://node-a:3000,node-b=http://node-b:3000,node-c=http://node-c:3000
+    ANTI_ENTROPY_INTERVAL_MS: "2000"
+
+services:
+  node-a:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node-a
+    ports:
+      - "3001:3000"
+
+  node-b:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node-b
+    ports:
+      - "3002:3000"
+
+  node-c:
+    <<: *node
+    environment:
+      <<: *env
+      NODE_ID: node-c
+    ports:
+      - "3003:3000"

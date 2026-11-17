@@ -1,0 +1,13 @@
+# Things that must NOT go into the image: they are not needed there,
+# and keeping them out makes builds faster and the image smaller.
+.git
+.github
+node_modules
+npm-debug.log
+test
+scripts
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+.nvmrc
