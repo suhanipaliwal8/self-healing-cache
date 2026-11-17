@@ -1,0 +1,12 @@
+# "Never take more than one cache pod away at a time" (for planned work such as
+# draining a machine). With 2 copies of every key, losing two nodes at once
+# could lose keys.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cache
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: cache
