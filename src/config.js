@@ -62,6 +62,12 @@ export function loadFailureDetectorConfig(env = process.env) {
   };
 }
 
+// Anti-entropy setting from environment variables.
+//   ANTI_ENTROPY_INTERVAL_MS  how often a node compares notes with every peer (default 5000)
+export function loadRebalanceConfig(env = process.env) {
+  return { intervalMs: positiveInteger(env, 'ANTI_ENTROPY_INTERVAL_MS', 5000) };
+}
+
 // Read settings from environment variables.
 //   NODE_ID  who this node is (must appear in CLUSTER)
 //   CLUSTER  every node in the cluster, as id=url pairs
