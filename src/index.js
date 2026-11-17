@@ -4,6 +4,7 @@ import { startSweeper } from './expiry.js';
 import { Cluster } from './cluster.js';
 import { FailureDetector } from './failure-detector.js';
 import { Rebalancer } from './rebalancer.js';
+import { installShutdown } from './shutdown.js';
 import {
   loadConfig,
   loadReplicationConfig,
@@ -25,7 +26,7 @@ if (nodes.length > 0) {
 }
 
 const store = new Store();
-startSweeper(store, 1000);
+const stopSweeper = startSweeper(store, 1000);
 
 // The rebalancer keeps copies correct: it moves keys when nodes join or leave,
 // and fills a node that came back empty.
@@ -41,6 +42,7 @@ server.listen(port, () => {
   void rebalancer?.reconcile();
 });
 
+const stoppers = [stopSweeper];
 if (cluster) {
   // Watch the other nodes with heartbeats. The member list can grow at runtime,
   // so we always run the detector.
@@ -54,4 +56,8 @@ if (cluster) {
   });
   detector.start();
   rebalancer.start(antiEntropy.intervalMs);
+  stoppers.push(() => detector.stop(), () => rebalancer.stop());
 }
+
+// Docker and Kubernetes stop us with SIGTERM: finish cleanly instead of being killed.
+installShutdown({ server, stop: stoppers });
