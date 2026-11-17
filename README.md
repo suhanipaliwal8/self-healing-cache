@@ -6,10 +6,9 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 8 complete: every write has a version, copies repair
-> themselves, keys move automatically when a node joins or leaves, and a node
-> that comes back empty is refilled. The Docker, Kubernetes and chaos-demo
-> phases come next.
+> **Status:** 🚧 Phase 9 complete: the node ships as a Docker image and a
+> 3-node cluster starts with one `docker compose up`. Kubernetes and the
+> chaos demo come next.
 
 ## Why this project?
 
@@ -28,7 +27,7 @@ and rebalancing.
 - [x] Automatic failure detection (heartbeat)
 - [x] Automatic failover for writes, with client retry
 - [x] Automatic rebalancing when nodes join, leave or return
-- [ ] Docker image and Kubernetes (StatefulSet) deployment
+- [x] Docker image and a 3-node `docker compose` cluster
 - [ ] Live "kill a node" demo with zero failed requests (full chaos test)
 - [ ] Stretch: LRU eviction, quorum reads/writes
 
@@ -92,6 +91,39 @@ Now type `kill node-c` and write again. The replica takes over:
 x-served-by: node-b
 x-failed-over-from: node-c
 ```
+
+### Run with Docker
+
+Requires Docker (Docker Desktop on Windows or Mac).
+
+```bash
+docker compose up --build     # builds the image and starts node-a, node-b, node-c
+docker compose ps             # all three should be "healthy"
+```
+
+You reach the nodes from your machine on ports 3001, 3002 and 3003, so every
+`curl` and `npm run demo:...` command above works unchanged. Inside Docker the
+nodes find each other by service name (`http://node-a:3000`), because
+`localhost` inside a container means the container itself.
+
+```bash
+docker compose stop node-c     # a clean stop: the node gets SIGTERM and exits
+docker compose start node-c    # it comes back empty and refills from its peers
+docker compose down            # remove the containers
+```
+
+Build and run a single node without compose:
+
+```bash
+docker build -t self-healing-cache .
+docker run --rm -p 3000:3000 self-healing-cache
+```
+
+The image is small (`node:24-alpine`, no dependencies), runs as the non-root
+`node` user, has a health check on `/health`, and starts `node` directly so it
+receives `SIGTERM`. On `SIGTERM` or `SIGINT` the node stops its timers, stops
+accepting connections, lets running requests finish (up to 5 seconds) and
+exits.
 
 ### See your data move
 
@@ -329,6 +361,7 @@ src/
   cluster.js            one node's view: key owners, replicas, who is up
   failure-detector.js   heartbeat pings that mark nodes up or down
   rebalancer.js         moves keys, catches nodes up, anti-entropy
+  shutdown.js           clean exit on SIGTERM / SIGINT
   config.js             reads NODE_ID / CLUSTER / PORT / replication / heartbeat settings
   server.js             HTTP layer: forwarding, replication, failover, membership
   client.js             CacheClient: round robin and retries
@@ -340,6 +373,9 @@ scripts/
   data-demo.js      fill / check / where: see your data move
 test/               tests using the built-in node:test runner
 .nvmrc              Node version used for development
+Dockerfile          builds the node image (node:24-alpine)
+.dockerignore       files that stay out of the image
+docker-compose.yml  a 3-node cluster in containers
 ```
 
 ## Running tests
@@ -361,11 +397,12 @@ npm test
 | 6     | 20        | 90    |
 | 7     | 16 (1 replaced) | 105 |
 | 8     | 26        | 131   |
+| 9     | 6         | 137   |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 9 puts the node into a
-Docker image, and Phase 10 runs the cluster on Kubernetes.
+Each phase is delivered as one pull request. Phase 10 runs the cluster on
+Kubernetes (a StatefulSet on a local kind cluster).
 
 ## License
 
