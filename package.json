@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
+    "chaos": "node scripts/chaos-demo.js",
     "cluster": "node scripts/dev-cluster.js",
     "demo:client": "node scripts/client-demo.js",
     "demo:data": "node scripts/data-demo.js",
