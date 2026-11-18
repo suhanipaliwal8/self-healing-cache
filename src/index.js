@@ -10,12 +10,14 @@ import {
   loadReplicationConfig,
   loadFailureDetectorConfig,
   loadRebalanceConfig,
+  loadStoreConfig,
 } from './config.js';
 
 const { nodeId, port, nodes } = loadConfig();
 const { replicationFactor, replicationMode } = loadReplicationConfig();
 const heartbeat = loadFailureDetectorConfig();
 const antiEntropy = loadRebalanceConfig();
+const { maxEntries } = loadStoreConfig();
 
 let cluster;
 if (nodes.length > 0) {
@@ -25,7 +27,7 @@ if (nodes.length > 0) {
   }
 }
 
-const store = new Store();
+const store = new Store({ maxEntries });
 const stopSweeper = startSweeper(store, 1000);
 
 // The rebalancer keeps copies correct: it moves keys when nodes join or leave,
@@ -37,7 +39,8 @@ server.listen(port, () => {
   const mode = cluster
     ? `cluster of ${nodes.length}, replication factor ${replicationFactor} (${replicationMode})`
     : 'single-node mode';
-  console.log(`${nodeId} listening on port ${port} (${mode})`);
+  const limit = maxEntries > 0 ? `, LRU limit ${maxEntries} keys` : '';
+  console.log(`${nodeId} listening on port ${port} (${mode}${limit})`);
   // Ask the others for the keys we should hold (we may be a node that just came back).
   void rebalancer?.reconcile();
 });
