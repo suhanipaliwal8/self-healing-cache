@@ -12,20 +12,19 @@ jobs:
       - name: Get the code
         uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-
-      - name: Chaos demo - stop a node under load
-        run: node scripts/chaos-demo.js --duration 20 --kill-at 6 --settle 5 --kill "docker compose stop node-c"
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Run tests
         run: npm test
+
+      - name: Chaos demo - stop a node under load
+        run: node scripts/chaos-demo.js --duration 20 --kill-at 6 --settle 5 --kill "docker compose stop node-c"
 
   docker:
     runs-on: ubuntu-latest
