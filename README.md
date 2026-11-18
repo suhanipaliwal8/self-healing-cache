@@ -6,9 +6,9 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 9 complete: the node ships as a Docker image and a
-> 3-node cluster starts with one `docker compose up`. Kubernetes and the
-> chaos demo come next.
+> **Status:** 🚧 Phase 10 complete: the cluster runs on Kubernetes as a
+> StatefulSet, and a deleted pod comes back with the same name and refills
+> itself. The chaos demo (kill a node under load) comes next.
 
 ## Why this project?
 
@@ -28,6 +28,7 @@ and rebalancing.
 - [x] Automatic failover for writes, with client retry
 - [x] Automatic rebalancing when nodes join, leave or return
 - [x] Docker image and a 3-node `docker compose` cluster
+- [x] Kubernetes (StatefulSet on a local kind cluster) deployment
 - [ ] Live "kill a node" demo with zero failed requests (full chaos test)
 - [ ] Stretch: LRU eviction, quorum reads/writes
 
@@ -124,6 +125,52 @@ The image is small (`node:24-alpine`, no dependencies), runs as the non-root
 receives `SIGTERM`. On `SIGTERM` or `SIGINT` the node stops its timers, stops
 accepting connections, lets running requests finish (up to 5 seconds) and
 exits.
+
+### Run on Kubernetes (kind)
+
+Requires [kind](https://kind.sigs.k8s.io) and `kubectl`. This runs three pods
+(`cache-0`, `cache-1`, `cache-2`) in a local Kubernetes cluster.
+
+```bash
+kind create cluster --name cache
+docker build -t self-healing-cache:dev .
+kind load docker-image self-healing-cache:dev --name cache   # the cluster cannot pull a local image
+kubectl apply -f k8s/
+kubectl rollout status statefulset/cache
+kubectl get pods -l app=cache
+```
+
+The pods live inside the cluster. To reach them from your laptop, leave this
+running in its own terminal (cache-0 on port 3001, cache-1 on 3002, cache-2 on
+3003), then use the same demos as before:
+
+```bash
+npm run k8s:forward
+npm run demo:data -- fill 300
+kubectl delete pod cache-1          # Kubernetes recreates it with the same name
+npm run demo:data -- check 300      # 0 missing; the new pod refills from its peers
+```
+
+Clean up with `kubectl delete -f k8s/` and `kind delete cluster --name cache`.
+
+How it fits together (`k8s/`):
+
+- **StatefulSet** (`statefulset.yaml`): three pods with stable names. A pod that
+  dies comes back with the same name (and an empty memory), so the hash ring
+  does not change. The pod name becomes `NODE_ID`; `CLUSTER` lists the three
+  members by DNS name (`cache-0.cache`, ...). Keep `replicas` and `CLUSTER` in step.
+- **Headless Service** (`services.yaml`, `cache`): gives every pod its own DNS
+  name, published even before the pod is Ready so nodes can find each other
+  while starting. A second Service, `cache-client`, load-balances clients
+  inside the cluster.
+- **Probes**: readiness takes a pod out of the Service when `/health` fails;
+  liveness restarts it only after 60 seconds of failures (a restart empties
+  the memory).
+- **Safe updates**: `minReadySeconds: 10` gives a replaced pod time to refill
+  before the next one is touched, and a PodDisruptionBudget (`pdb.yaml`) allows
+  only one pod to be taken away at a time for planned work.
+- **Limits**: 256Mi memory per pod. A pod that fills it is restarted empty;
+  eviction (a later phase) is the real fix.
 
 ### See your data move
 
@@ -371,8 +418,10 @@ scripts/
   dev-cluster.js    starts several nodes locally; kill / start / freeze / thaw / join / leave
   client-demo.js    writes and reads keys while you break nodes
   data-demo.js      fill / check / where: see your data move
+  k8s-forward.js    keeps kubectl port-forward running for each pod
 test/               tests using the built-in node:test runner
 .nvmrc              Node version used for development
+k8s/                StatefulSet, Services and PodDisruptionBudget
 Dockerfile          builds the node image (node:24-alpine)
 .dockerignore       files that stay out of the image
 docker-compose.yml  a 3-node cluster in containers
@@ -398,11 +447,12 @@ npm test
 | 7     | 16 (1 replaced) | 105 |
 | 8     | 26        | 131   |
 | 9     | 6         | 137   |
+| 10    | 3         | 140   |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 10 runs the cluster on
-Kubernetes (a StatefulSet on a local kind cluster).
+Each phase is delivered as one pull request. Phase 11 is the chaos demo: kill
+a node under load and prove that no request fails.
 
 ## License
 
