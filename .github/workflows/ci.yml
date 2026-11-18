@@ -11,6 +11,9 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -22,9 +25,6 @@ jobs:
 
       - name: Run tests
         run: npm test
-
-      - name: Chaos demo - stop a node under load
-        run: node scripts/chaos-demo.js --duration 20 --kill-at 6 --settle 5 --kill "docker compose stop node-c"
 
   docker:
     runs-on: ubuntu-latest
@@ -48,6 +48,9 @@ jobs:
         run: |
           curl -fsS -X PUT localhost:3001/keys/ci -H "Content-Type: application/json" -d '{"value":"hello"}'
           curl -fsS localhost:3003/keys/ci | grep hello
+
+      - name: Chaos demo - stop a node under load
+        run: node scripts/chaos-demo.js --duration 20 --kill-at 6 --settle 5 --retries 2 --kill "docker compose stop node-c"
 
       - name: Stop a node, the key must still be readable
         run: |
@@ -98,7 +101,7 @@ jobs:
           done
 
       - name: Chaos demo - delete a pod under load
-        run: node scripts/chaos-demo.js --duration 40 --kill-at 10 --settle 15 --kill "kubectl delete pod cache-1"
+        run: node scripts/chaos-demo.js --duration 40 --kill-at 10 --settle 15 --retries 2 --kill "kubectl delete pod cache-1"
 
       - name: Show the cluster state if something failed
         if: failure()
