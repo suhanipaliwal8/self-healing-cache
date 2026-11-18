@@ -245,6 +245,15 @@ export function createServer(
         return sendJson(res, 200, { self: cluster.selfId, nodes: cluster.nodes });
       }
 
+      // Memory usage of THIS node (not forwarded anywhere).
+      if (req.method === 'GET' && url.pathname === '/stats') {
+        return sendJson(res, 200, {
+          keys: store.size,
+          maxEntries: store.maxEntries,
+          evictions: store.stats.evictions,
+        });
+      }
+
       // Internal bulk endpoints, used by the Rebalancer (see src/rebalancer.js).
       if (req.method === 'GET' && url.pathname === '/internal/digest') {
         // Every key we hold (including tombstones) with its version, but no values.
@@ -268,7 +277,12 @@ export function createServer(
       if (req.method === 'POST' && url.pathname === '/internal/entries') {
         const { entries } = JSON.parse(await readBody(req));
         let applied = 0;
-        for (const { key, ...record } of entries) if (store.applyRecord(key, record)) applied++;
+        // evict:false: this is background copying. If we are full we refuse NEW
+        // keys instead of evicting others, or eviction and anti-entropy would
+        // keep undoing each other forever.
+        for (const { key, ...record } of entries) {
+          if (store.applyRecord(key, record, { evict: false })) applied++;
+        }
         return sendJson(res, 200, { applied });
       }
 
