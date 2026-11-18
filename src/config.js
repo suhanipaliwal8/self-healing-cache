@@ -88,3 +88,15 @@ export function loadConfig(env = process.env) {
   const port = Number(env.PORT) || Number(new URL(self.url).port) || 3000;
   return { nodeId, port, nodes };
 }
+
+// Memory limit from environment variables.
+//   MAX_ENTRIES  most live keys this node may hold (default 0 = no limit)
+export function loadStoreConfig(env = process.env) {
+  const text = env.MAX_ENTRIES;
+  if (text === undefined || text === '') return { maxEntries: 0 };
+  const value = Number(text);
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`MAX_ENTRIES must be a whole number >= 0 (0 = no limit), got "${text}"`);
+  }
+  return { maxEntries: value };
+}

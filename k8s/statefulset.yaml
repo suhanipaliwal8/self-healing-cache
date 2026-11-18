@@ -42,6 +42,10 @@ spec:
               value: "cache-0=http://cache-0.cache:3000,cache-1=http://cache-1.cache:3000,cache-2=http://cache-2.cache:3000"
             - name: ANTI_ENTROPY_INTERVAL_MS
               value: "2000"
+            # Memory limit in KEYS (not bytes). With the 256Mi pod limit, a node that
+            # grows without a limit would be OOMKilled; with this it evicts old keys.
+            - name: MAX_ENTRIES
+              value: "100000"
           # Ready = "send me traffic". Not Ready = taken out of the cache-client Service.
           readinessProbe:
             httpGet:

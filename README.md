@@ -6,9 +6,7 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 11 complete: a chaos demo keeps a steady load on the
-> cluster, kills a node in the middle, and checks that no request failed and
-> no data was lost. Stretch goals (LRU eviction, quorum reads/writes) are next.
+**Status:** Phase 12 done: LRU eviction (memory limit per node).
 
 ## Why this project?
 
@@ -30,7 +28,8 @@ and rebalancing.
 - [x] Docker image and a 3-node `docker compose` cluster
 - [x] Kubernetes (StatefulSet on a local kind cluster) deployment
 - [x] Live "kill a node" demo with zero failed requests (chaos test, also run in CI)
-- [ ] Stretch: LRU eviction, quorum reads/writes
+- [x] Stretch: LRU eviction
+- [ ] Stretch: quorum reads/writes
 
 ## Tech stack
 
@@ -265,6 +264,7 @@ RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
 | `HEARTBEAT_TIMEOUT_MS` | How long to wait for one ping answer | `500` |
 | `FAILURE_THRESHOLD` | Failed pings in a row before a node counts as down | `3` |
 | `ANTI_ENTROPY_INTERVAL_MS` | How often a node compares notes with every peer | `5000` |
+| `MAX_ENTRIES` | Most live keys one node may hold. When full, the least recently used key is evicted. | `0` (no limit) |
 
 ## API
 
@@ -277,6 +277,7 @@ RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
 | `PUT` | `/keys/:key` | `{"value": <any JSON>, "ttl": <seconds, optional>}` | `200 {"ok":true}` |
 | `GET` | `/keys/:key` | none | `200 {"key":"...","value":...}` or `404` |
 | `DELETE` | `/keys/:key` | none | `200 {"deleted":true}` or `{"deleted":false}` |
+| `GET` | `/stats` | none | This node's `{ keys, maxEntries, evictions }` (not forwarded) |
 
 Errors: `400` for invalid JSON, a missing `value`, or a `ttl` that is not a
 positive number; `405` for an unsupported method; `404` for unknown paths;
@@ -426,6 +427,31 @@ runs when membership changes (**rebalance**), when a node comes back or starts
   restarted empty, and after a node left, 0 keys were missing and every key
   still had 2 copies.
 
+### Memory limit and LRU eviction
+
+Memory is finite (the Kubernetes pods have a 256Mi limit). With `MAX_ENTRIES=N`
+a node keeps at most N live keys. When a new key does not fit, the **least
+recently used** key is evicted.
+
+- **How:** a JavaScript `Map` remembers insertion order. Using a key (GET or
+  PUT) moves it to the end; the first live key is the one to evict. Everything
+  is O(1), no extra data structure.
+- **What counts:** live keys. Tombstones are not counted and never evicted
+  (evicting one could resurrect a deleted key). Expired keys count until swept.
+- **Each node decides alone.** The other copy plus read-on-miss is the backup.
+- **Eviction vs anti-entropy:** background copying (rebalancer and
+  `/internal/entries`) uses `evict: false`. A full node refuses *new* keys from
+  it, instead of evicting someone. Otherwise the two mechanisms would undo each
+  other forever ("thrashing"). Normal client writes do evict.
+- **Why LRU and not LFU:** LRU needs no counters and adapts quickly.
+
+```bash
+MAX_ENTRIES=3 npm start
+curl localhost:3000/stats   # { "keys": 0, "maxEntries": 3, "evictions": 0 }
+```
+
+> Run the chaos demo **without** `MAX_ENTRIES`: an evicted key counts as lost.
+
 ### Data lives in memory only
 
 Like Redis without persistence, a node that restarts comes back **empty**.
@@ -441,12 +467,14 @@ its peers refill it.
 | A node that was down while membership changed does not know about the change | The member change is a one-time broadcast; Kubernetes (Phase 10) gives a stable member list |
 | A node down for longer than the tombstone lifetime (10 min) can bring back a deleted key | Tombstones are cleaned up |
 | Digests list every key | Fine at this size; large systems use Merkle trees |
+| The limit counts keys, not bytes | A few huge values can still use a lot of memory. A byte-based limit needs size accounting. |
+| Full peers keep refusing repair | A full node refuses new keys from anti-entropy, so peers may re-send them every round (some wasted traffic, no data loss). |
 
 ## Project structure
 
 ```
 src/
-  store.js              in-memory key-value store: TTL, versions, tombstones
+  store.js              in-memory key-value store: TTL, versions, tombstones, LRU eviction
   expiry.js             background sweeper that removes expired keys
   hash-ring.js          consistent hash ring with virtual nodes
   cluster.js            one node's view: key owners, replicas, who is up
@@ -495,12 +523,15 @@ npm test
 | 9     | 6         | 137   |
 | 10    | 3         | 140   |
 | 11    | 11        | 151   |
+| 12    | 16        | 167   |
 
 ## Roadmap
 
 Each phase is delivered as one pull request. The core requirements are done.
 Phase 12 adds LRU eviction and Phase 13 adds quorum reads and writes (both
 stretch goals).
+
+Next: **Phase 13**, quorum reads/writes (the last stretch goal).
 
 ## License
 

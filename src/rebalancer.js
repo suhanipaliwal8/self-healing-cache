@@ -86,7 +86,8 @@ export class Rebalancer {
           keys: toFetch.slice(i, i + CHUNK),
         });
         for (const { key, ...record } of entries) {
-          if (this.#store.applyRecord(key, record)) this.stats.received++;
+          // evict:false: repairing must never push out a key someone is using.
+          if (this.#store.applyRecord(key, record, { evict: false })) this.stats.received++;
         }
       }
     } catch {

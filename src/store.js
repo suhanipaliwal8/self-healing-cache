@@ -15,16 +15,43 @@ export function isNewer(a, b) {
 // A delete does not just forget the key: it leaves a small "tombstone" with a
 // version. Without it, a node that missed the delete would later hand the old
 // value back to everyone ("resurrection"). Tombstones disappear after a while.
+//
+// MEMORY LIMIT (LRU): with maxEntries > 0 the store keeps at most that many
+// LIVE keys. When a new key does not fit, the Least Recently Used key goes.
+// A JavaScript Map remembers insertion order, so:
+//   - the FIRST key in the Map is the least recently used one,
+//   - every time a key is used we delete + set it again, which moves it to the END.
+// Tombstones are never counted and never evicted (evicting one could bring a
+// deleted key back to life).
 export class Store {
   #data = new Map(); // key -> { value, expiresAt, version, writer, deleted }
   #now;
   #tombstoneTtlMs;
+  #maxEntries;
+  #live = 0; // how many non-deleted entries are in #data
+
+  // Plain counters that the server shows on GET /stats.
+  stats = { evictions: 0 };
 
   // "now" is a function that returns the current time. Tests pass a fake
   // clock so they can "travel in time" without waiting.
-  constructor({ now = Date.now, tombstoneTtlMs = 10 * 60 * 1000 } = {}) {
+  // maxEntries: 0 means "no limit" (the old behaviour).
+  constructor({ now = Date.now, tombstoneTtlMs = 10 * 60 * 1000, maxEntries = 0 } = {}) {
+    if (!Number.isInteger(maxEntries) || maxEntries < 0) {
+      throw new Error(`maxEntries must be a whole number >= 0, got ${maxEntries}`);
+    }
     this.#now = now;
     this.#tombstoneTtlMs = tombstoneTtlMs;
+    this.#maxEntries = maxEntries;
+  }
+
+  get maxEntries() {
+    return this.#maxEntries;
+  }
+
+  // How many more NEW live keys fit before something would be evicted.
+  get room() {
+    return this.#maxEntries === 0 ? Infinity : this.#maxEntries - this.#live;
   }
 
   // ttlMs: expire this many milliseconds from now.
@@ -39,7 +66,7 @@ export class Store {
     } else if (ttlMs !== undefined) {
       expiry = this.#now() + ttlMs;
     }
-    this.#data.set(key, {
+    this.#put(key, {
       value,
       expiresAt: expiry,
       version: version ?? this.#nextVersion(key),
@@ -57,16 +84,62 @@ export class Store {
     return entry.expiresAt !== null && entry.expiresAt <= this.#now();
   }
 
-  // Returns { value, expiresAt } or undefined if missing, deleted or expired.
-  // This is "lazy expiry": an expired key is removed the moment someone asks.
-  getEntry(key) {
+  // ---------- the three places that change #data (so #live stays right) ----------
+
+  // Put an entry at the END of the Map (= "most recently used"), then make
+  // room if we are over the limit.
+  #put(key, entry) {
+    const old = this.#data.get(key);
+    if (old !== undefined && !old.deleted) this.#live--;
+    this.#data.delete(key); // delete first, so the key moves to the end
+    this.#data.set(key, entry);
+    if (!entry.deleted) this.#live++;
+    this.#evictIfFull();
+  }
+
+  // Remove a key completely. Returns true if it was there.
+  #drop(key) {
+    const old = this.#data.get(key);
+    if (old === undefined) return false;
+    if (!old.deleted) this.#live--;
+    return this.#data.delete(key);
+  }
+
+  // While we hold too many live keys, remove the least recently used one.
+  // Tombstones are skipped: they do not count and must not be evicted.
+  #evictIfFull() {
+    if (this.#maxEntries === 0) return;
+    while (this.#live > this.#maxEntries) {
+      for (const [key, entry] of this.#data) {
+        if (entry.deleted) continue;
+        this.#drop(key);
+        this.stats.evictions++;
+        break;
+      }
+    }
+  }
+
+  // Look at an entry WITHOUT counting it as "used". An expired entry is removed
+  // on the spot ("lazy expiry").
+  #peek(key) {
     const entry = this.#data.get(key);
     if (entry === undefined) return undefined;
     if (this.#isExpired(entry)) {
-      this.#data.delete(key);
+      this.#drop(key);
       return undefined;
     }
-    if (entry.deleted) return undefined;
+    return entry;
+  }
+
+  // ---------- reading ----------
+
+  // Returns { value, expiresAt } or undefined if missing, deleted or expired.
+  // A successful read counts as "use": the key moves to the end of the Map.
+  getEntry(key) {
+    const entry = this.#peek(key);
+    if (entry === undefined || entry.deleted) return undefined;
+    this.#data.delete(key);
+    this.#data.set(key, entry);
     return { value: entry.value, expiresAt: entry.expiresAt };
   }
 
@@ -74,20 +147,22 @@ export class Store {
     return this.getEntry(key)?.value;
   }
 
+  // has() only asks "do you have it?", it does NOT count as use.
   has(key) {
-    return this.getEntry(key) !== undefined;
+    const entry = this.#peek(key);
+    return entry !== undefined && !entry.deleted;
   }
 
   // Returns true if the key existed. Either way a tombstone is left behind, so
   // the delete also reaches copies that were not told about it yet.
   delete(key, { version, writer = '' } = {}) {
-    const existed = this.getEntry(key) !== undefined;
+    const existed = this.has(key);
     this.#putTombstone(key, version ?? this.#nextVersion(key), writer);
     return existed;
   }
 
   #putTombstone(key, version, writer) {
-    this.#data.set(key, {
+    this.#put(key, {
       value: null,
       expiresAt: this.#now() + this.#tombstoneTtlMs,
       version,
@@ -99,14 +174,11 @@ export class Store {
   // ---------- used when nodes copy data to each other ----------
 
   // The full record for a key: live value OR tombstone (undefined if nothing
-  // is stored or it expired).
+  // is stored or it expired). Does NOT count as use, so the background digests
+  // of anti-entropy never disturb the LRU order.
   getRecord(key) {
-    const entry = this.#data.get(key);
+    const entry = this.#peek(key);
     if (entry === undefined) return undefined;
-    if (this.#isExpired(entry)) {
-      this.#data.delete(key);
-      return undefined;
-    }
     return { ...entry };
   }
 
@@ -121,12 +193,22 @@ export class Store {
   // Store a record that came from another node, but ONLY if it is newer than
   // what we have. Returns true if we took it. Running the same record twice
   // changes nothing the second time, so copying is always safe to repeat.
-  applyRecord(key, record) {
+  //
+  // evict: false is for BACKGROUND copying (the Rebalancer). If the record would
+  // add a NEW live key and we are full, we refuse instead of evicting someone.
+  // Otherwise eviction and anti-entropy would undo each other forever.
+  // Updates of keys we already hold, and tombstones, are always accepted.
+  applyRecord(key, record, { evict = true } = {}) {
     if (record.deleted !== true && record.expiresAt !== null && record.expiresAt <= this.#now()) {
       return false; // it already expired on the way here
     }
-    if (!isNewer(record, this.getRecord(key))) return false;
-    this.#data.set(key, {
+    const existing = this.getRecord(key);
+    if (!isNewer(record, existing)) return false;
+
+    const addsNewLiveKey = record.deleted !== true && (existing === undefined || existing.deleted);
+    if (!evict && addsNewLiveKey && this.room <= 0) return false;
+
+    this.#put(key, {
       value: record.deleted ? null : record.value,
       expiresAt: record.deleted ? (record.expiresAt ?? this.#now() + this.#tombstoneTtlMs) : record.expiresAt,
       version: record.version,
@@ -141,7 +223,7 @@ export class Store {
   removeIfUnchanged(key, { version, writer }) {
     const current = this.#data.get(key);
     if (current === undefined || current.version !== version || current.writer !== writer) return false;
-    return this.#data.delete(key);
+    return this.#drop(key);
   }
 
   // "Active expiry": remove every expired key (and old tombstone) now.
@@ -151,18 +233,16 @@ export class Store {
     let removed = 0;
     for (const [key, entry] of this.#data) {
       if (entry.expiresAt !== null && entry.expiresAt <= now) {
-        this.#data.delete(key);
+        this.#drop(key);
         removed++;
       }
     }
     return removed;
   }
 
-  // Raw number of live keys. May include expired keys not yet swept.
-  // Tombstones are not counted.
+  // Number of live keys. May include expired keys not yet swept.
+  // Tombstones are not counted. (O(1): we keep a running counter.)
   get size() {
-    let count = 0;
-    for (const entry of this.#data.values()) if (!entry.deleted) count++;
-    return count;
+    return this.#live;
   }
 }
