@@ -70,10 +70,13 @@ export class CacheClient {
     this.stats.requests++;
     const attempts = this.#retries + 1;
     let lastProblem = 'no attempt was made';
+    // One step of the rotation per request. Every retry then goes to the NEXT
+    // node after the one just tried, even when many requests run at once.
+    const start = this.#next++;
 
     for (let attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) this.stats.retries++;
-      const node = this.#nodes[this.#next++ % this.#nodes.length];
+      const node = this.#nodes[(start + attempt) % this.#nodes.length];
 
       try {
         const response = await this.#fetch(`${node}/keys/${encodeURIComponent(key)}`, {

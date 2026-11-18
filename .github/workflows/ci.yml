@@ -11,11 +11,17 @@ jobs:
     steps:
       - name: Get the code
         uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version-file: .nvmrc
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Run tests
         run: npm test
@@ -43,6 +49,9 @@ jobs:
           curl -fsS -X PUT localhost:3001/keys/ci -H "Content-Type: application/json" -d '{"value":"hello"}'
           curl -fsS localhost:3003/keys/ci | grep hello
 
+      - name: Chaos demo - stop a node under load
+        run: node scripts/chaos-demo.js --duration 20 --kill-at 6 --settle 5 --retries 2 --kill "docker compose stop node-c"
+
       - name: Stop a node, the key must still be readable
         run: |
           docker compose stop node-c
@@ -56,3 +65,47 @@ jobs:
       - name: Clean up
         if: always()
         run: docker compose down
+  
+  chaos-k8s:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Create a kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: cache
+
+      - name: Build the image and load it into kind
+        run: |
+          docker build -t self-healing-cache:dev .
+          kind load docker-image self-healing-cache:dev --name cache
+
+      - name: Deploy the StatefulSet
+        run: |
+          kubectl apply -f k8s/
+          kubectl rollout status statefulset/cache --timeout=180s
+
+      - name: Reach the pods from the runner
+        run: |
+          nohup node scripts/k8s-forward.js > forward.log 2>&1 &
+          for port in 3001 3002 3003; do
+            for i in $(seq 1 30); do
+              if curl -fs http://localhost:$port/health > /dev/null; then break; fi
+              sleep 1
+            done
+            curl -fs http://localhost:$port/health
+          done
+
+      - name: Chaos demo - delete a pod under load
+        run: node scripts/chaos-demo.js --duration 40 --kill-at 10 --settle 15 --retries 2 --kill "kubectl delete pod cache-1"
+
+      - name: Show the cluster state if something failed
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe pods
+          kubectl logs -l app=cache --tail=50 --prefix

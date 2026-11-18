@@ -19,6 +19,12 @@ USER node
 
 # The node listens on this port inside the container.
 ENV PORT=3000
+
+# Node looks up host names in a small thread pool (4 threads by default). A stopped
+# container's name can take seconds to fail, and a few stuck lookups would freeze
+# lookups to the healthy nodes too. A bigger pool keeps them working.
+ENV UV_THREADPOOL_SIZE=64
+
 EXPOSE 3000
 
 # Docker asks "are you healthy?" by calling our own /health endpoint.
