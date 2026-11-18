@@ -1,0 +1,64 @@
+# Three cache nodes with stable names: cache-0, cache-1, cache-2.
+# A pod that dies comes back with the SAME name (and an empty memory); its
+# peers then refill it (Phase 8).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cache
+  labels:
+    app: cache
+spec:
+  serviceName: cache        # the headless Service that gives the pods their DNS names
+  replicas: 3               # keep in step with the CLUSTER list below
+  podManagementPolicy: Parallel   # start all pods together (the nodes do not need an order)
+  minReadySeconds: 10       # after a pod is Ready, wait 10 s before touching the next one
+  selector:
+    matchLabels:
+      app: cache
+  template:
+    metadata:
+      labels:
+        app: cache
+    spec:
+      terminationGracePeriodSeconds: 10   # our node exits within a second of SIGTERM
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000                   # the "node" user of the image, as a number
+      containers:
+        - name: cache
+          image: self-healing-cache:dev
+          imagePullPolicy: IfNotPresent   # use the image we loaded into kind
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            # The pod's own name (cache-0, cache-1, ...) becomes the node id.
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Every member, by its stable DNS name (<pod>.<headless service>).
+            - name: CLUSTER
+              value: "cache-0=http://cache-0.cache:3000,cache-1=http://cache-1.cache:3000,cache-2=http://cache-2.cache:3000"
+            - name: ANTI_ENTROPY_INTERVAL_MS
+              value: "2000"
+          # Ready = "send me traffic". Not Ready = taken out of the cache-client Service.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+          # Alive = "do not restart me". Generous, because a restart empties the memory.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

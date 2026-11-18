@@ -9,6 +9,7 @@
     "demo:client": "node scripts/client-demo.js",
     "demo:data": "node scripts/data-demo.js",
     "demo:ring": "node scripts/ring-demo.js",
+    "k8s:forward": "node scripts/k8s-forward.js",
     "test": "node --test"
   },
   "engines": {

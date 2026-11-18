@@ -1,0 +1,38 @@
+# Two Services for the same pods (they pick the pods with the label app: cache).
+
+# 1) HEADLESS Service: gives every pod its own stable DNS name,
+#    cache-0.cache, cache-1.cache, cache-2.cache. The nodes use these names
+#    to find each other. The StatefulSet points at it with "serviceName: cache".
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache
+  labels:
+    app: cache
+spec:
+  clusterIP: None
+  # Publish a pod's DNS name even before it is Ready, so nodes can reach each
+  # other while they are still starting (heartbeats and catching up need that).
+  publishNotReadyAddresses: true
+  selector:
+    app: cache
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+---
+# 2) A normal Service for clients inside the cluster: one name that spreads
+#    requests over the Ready pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cache-client
+  labels:
+    app: cache
+spec:
+  selector:
+    app: cache
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

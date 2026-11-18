@@ -40,9 +40,9 @@ if (command === 'fill' || command === 'check') {
   }
   console.log(command === 'fill' ? `wrote ${count} keys` : `checked ${count} keys: ${bad} missing or wrong`);
 } else if (command === 'where') {
-  for (const [i, url] of urls.entries()) {
-    const id = `node-${String.fromCharCode(97 + i)}`;
+  for (const url of urls) {
     if (!(await alive(url))) continue;
+    const { self: id } = await (await fetch(`${url}/cluster`)).json(); // the node's real name
     const { entries } = await (await fetch(`${url}/internal/digest`)).json();
     const live = entries.filter((entry) => !entry.deleted).length;
     console.log(`${id}: ${String(live).padStart(4)} keys  ${'#'.repeat(Math.round(live / 10))}`);
