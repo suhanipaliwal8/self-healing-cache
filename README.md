@@ -6,9 +6,9 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-> **Status:** 🚧 Phase 10 complete: the cluster runs on Kubernetes as a
-> StatefulSet, and a deleted pod comes back with the same name and refills
-> itself. The chaos demo (kill a node under load) comes next.
+> **Status:** 🚧 Phase 11 complete: a chaos demo keeps a steady load on the
+> cluster, kills a node in the middle, and checks that no request failed and
+> no data was lost. Stretch goals (LRU eviction, quorum reads/writes) are next.
 
 ## Why this project?
 
@@ -29,7 +29,7 @@ and rebalancing.
 - [x] Automatic rebalancing when nodes join, leave or return
 - [x] Docker image and a 3-node `docker compose` cluster
 - [x] Kubernetes (StatefulSet on a local kind cluster) deployment
-- [ ] Live "kill a node" demo with zero failed requests (full chaos test)
+- [x] Live "kill a node" demo with zero failed requests (chaos test, also run in CI)
 - [ ] Stretch: LRU eviction, quorum reads/writes
 
 ## Tech stack
@@ -171,6 +171,48 @@ How it fits together (`k8s/`):
   only one pod to be taken away at a time for planned work.
 - **Limits**: 256Mi memory per pod. A pod that fills it is restarted empty;
   eviction (a later phase) is the real fix.
+
+### Chaos demo: kill a node under load
+
+`npm run chaos` keeps a steady load on the cluster (4 workers writing a key and
+reading it straight back), runs a command of your choice in the middle to break
+something, then reads back every key it wrote. It passes only if **no request
+failed** (after the client's retries), **no value was wrong**, and **no key was
+lost**. The exit code is 0 for PASS and 1 for FAIL, so CI can use it.
+
+```bash
+docker compose up -d --build
+npm run chaos -- --kill "docker compose stop node-c"
+npm run chaos -- --kill "kubectl delete pod cache-1" --duration 40 --kill-at 10 --settle 15
+npm run chaos -- --kill "docker compose stop node-c" --retries 0   # see why retries matter
+```
+
+| Option | Meaning | Default |
+|--------|---------|---------|
+| `--duration` | Seconds the load runs | `30` |
+| `--kill-at` | Second at which the kill command runs | `10` |
+| `--kill "<command>"` | Any shell command that breaks something | none (kill a node yourself) |
+| `--settle` | Seconds to wait before reading every key back | `5` |
+| `--concurrency` | Requests in flight at the same time | `4` |
+| `--retries` | Client retries per request | `1` |
+| `--nodes` | Comma separated node URLs (or the `NODES` variable) | `localhost:3001-3003` |
+
+Example result (numbers vary):
+
+```
+  requests:            1760 (880 writes, 880 reads)
+  retries used:        60
+  failed requests:     0
+  wrong values:        0
+  keys checked after:  880, lost: 0
+  latency (ms):        p50 4, p95 12, p99 2010, max 2050
+  verdict: PASS (zero failed requests, zero wrong values, zero lost keys)
+```
+
+The p99 and max latency jump to about 2 seconds right after the kill. Requests
+that reach the dead node wait for the 2 second forwarding timeout until the
+heartbeat marks the node down (3 to 4 seconds). They still succeed; they are
+just slow. Zero failed requests does not mean zero slow requests.
 
 ### See your data move
 
@@ -340,6 +382,8 @@ Going from 3 to 4 nodes with % N:  75.8% of keys moved
   answer, times out, or returns `502`, `503` or `504`, the client retries on
   the **next node** (default: 1 retry, 5 second timeout).
 - `404` and `400` are real answers and are never retried.
+- A retry always goes to a different node than the attempt before it, even when
+  many requests run at the same time.
 - Retrying is safe because `GET`, `PUT` and `DELETE` are idempotent: doing
   them twice leaves the cache in the same state.
 - In the live demo, with one node killed mid-run: 220 requests, 75 retries,
@@ -412,6 +456,7 @@ src/
   config.js             reads NODE_ID / CLUSTER / PORT / replication / heartbeat settings
   server.js             HTTP layer: forwarding, replication, failover, membership
   client.js             CacheClient: round robin and retries
+  chaos.js              load generator, key verification and report for the chaos demo
   index.js              starts a node
 scripts/
   ring-demo.js      prints how keys spread and move on the ring
@@ -419,6 +464,7 @@ scripts/
   client-demo.js    writes and reads keys while you break nodes
   data-demo.js      fill / check / where: see your data move
   k8s-forward.js    keeps kubectl port-forward running for each pod
+  chaos-demo.js     kill a node under load and check for failures and lost keys
 test/               tests using the built-in node:test runner
 .nvmrc              Node version used for development
 k8s/                StatefulSet, Services and PodDisruptionBudget
@@ -448,11 +494,13 @@ npm test
 | 8     | 26        | 131   |
 | 9     | 6         | 137   |
 | 10    | 3         | 140   |
+| 11    | 11        | 151   |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. Phase 11 is the chaos demo: kill
-a node under load and prove that no request fails.
+Each phase is delivered as one pull request. The core requirements are done.
+Phase 12 adds LRU eviction and Phase 13 adds quorum reads and writes (both
+stretch goals).
 
 ## License
 
