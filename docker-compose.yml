@@ -5,6 +5,10 @@
 x-node: &node
   build: .
   image: self-healing-cache:dev
+  # A name that does not resolve (stopped container) must fail FAST: 1 second, 1 try.
+  dns_opt:
+    - "timeout:1"
+    - "attempts:1"
   environment: &env
     CLUSTER: node-a=http://node-a:3000,node-b=http://node-b:3000,node-c=http://node-c:3000
     ANTI_ENTROPY_INTERVAL_MS: "2000"
