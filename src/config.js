@@ -100,3 +100,30 @@ export function loadStoreConfig(env = process.env) {
   }
   return { maxEntries: value };
 }
+
+// Quorum settings from environment variables.
+//   WRITE_QUORUM  how many copies must confirm a write (default 1 = the old behaviour)
+//   READ_QUORUM   how many copies are asked on a read (default 1)
+// Both must be between 1 and REPLICATION_FACTOR (N). W + R > N gives "a read always
+// sees the latest successful write". A write quorum above 1 needs sync replication,
+// because async mode does not wait for the replicas.
+export function loadQuorumConfig(env = process.env, { replicationFactor, replicationMode = 'sync' } = {}) {
+  const read = (name) => {
+    const text = env[name];
+    if (text === undefined) return 1;
+    const value = Number(text);
+    if (!Number.isInteger(value) || value < 1 || value > replicationFactor) {
+      throw new Error(
+        `${name} must be a whole number between 1 and REPLICATION_FACTOR (${replicationFactor}), got "${text}"`,
+      );
+    }
+    return value;
+  };
+
+  const writeQuorum = read('WRITE_QUORUM');
+  const readQuorum = read('READ_QUORUM');
+  if (writeQuorum > 1 && replicationMode !== 'sync') {
+    throw new Error('WRITE_QUORUM above 1 needs REPLICATION_MODE=sync (async mode does not wait for replicas)');
+  }
+  return { writeQuorum, readQuorum };
+}
