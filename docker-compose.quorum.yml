@@ -1,0 +1,26 @@
+# Quorum mode for the 3-node cluster.
+#   N = 3: every key lives on all three nodes
+#   W = 2: a write is "ok" once 2 nodes have it
+#   R = 2: a read asks 2 nodes and returns the newest answer
+# W + R = 4 is more than N = 3, so a read always sees the latest successful write.
+#
+# Use it ON TOP of the normal file (always pass both files, also for stop and down):
+#   docker compose -f docker-compose.yml -f docker-compose.quorum.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.quorum.yml down
+
+services:
+  node-a:
+    environment:
+      REPLICATION_FACTOR: "3"
+      WRITE_QUORUM: "2"
+      READ_QUORUM: "2"
+  node-b:
+    environment:
+      REPLICATION_FACTOR: "3"
+      WRITE_QUORUM: "2"
+      READ_QUORUM: "2"
+  node-c:
+    environment:
+      REPLICATION_FACTOR: "3"
+      WRITE_QUORUM: "2"
+      READ_QUORUM: "2"
