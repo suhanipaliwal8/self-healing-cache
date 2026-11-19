@@ -1,7 +1,17 @@
 {
   "name": "self-healing-cache",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "A sharded, replicated, self-healing distributed cache",
+  "keywords": [
+    "distributed-systems",
+    "cache",
+    "consistent-hashing",
+    "replication",
+    "failover",
+    "kubernetes",
+    "docker",
+    "chaos-engineering"
+  ],
   "type": "module",
   "scripts": {
     "start": "node src/index.js",
