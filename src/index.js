@@ -11,10 +11,17 @@ import {
   loadFailureDetectorConfig,
   loadRebalanceConfig,
   loadStoreConfig,
+  loadQuorumConfig,
 } from './config.js';
 
 const { nodeId, port, nodes } = loadConfig();
 const { replicationFactor, replicationMode } = loadReplicationConfig();
+const { writeQuorum, readQuorum } = loadQuorumConfig(process.env, { replicationFactor, replicationMode });
+if ((writeQuorum > 1 || readQuorum > 1) && writeQuorum + readQuorum <= replicationFactor) {
+  console.warn(
+    `warning: W=${writeQuorum} + R=${readQuorum} is not more than N=${replicationFactor}, so a read can still return an old value`,
+  );
+}
 const heartbeat = loadFailureDetectorConfig();
 const antiEntropy = loadRebalanceConfig();
 const { maxEntries } = loadStoreConfig();
@@ -34,13 +41,21 @@ const stopSweeper = startSweeper(store, 1000);
 // and fills a node that came back empty.
 const rebalancer = cluster ? new Rebalancer({ store, cluster, replicationFactor }) : undefined;
 
-const server = createServer(store, { cluster, replicationFactor, replicationMode, rebalancer });
+const server = createServer(store, {
+  cluster,
+  replicationFactor,
+  replicationMode,
+  writeQuorum,
+  readQuorum,
+  rebalancer,
+});
 server.listen(port, () => {
   const mode = cluster
     ? `cluster of ${nodes.length}, replication factor ${replicationFactor} (${replicationMode})`
     : 'single-node mode';
   const limit = maxEntries > 0 ? `, LRU limit ${maxEntries} keys` : '';
-  console.log(`${nodeId} listening on port ${port} (${mode}${limit})`);
+  const quorum = writeQuorum > 1 || readQuorum > 1 ? `, quorum W=${writeQuorum} R=${readQuorum}` : '';
+  console.log(`${nodeId} listening on port ${port} (${mode}${limit}${quorum})`);
   // Ask the others for the keys we should hold (we may be a node that just came back).
   void rebalancer?.reconcile();
 });

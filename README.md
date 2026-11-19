@@ -6,7 +6,7 @@ A Redis-style distributed cache built from scratch in Node.js: sharded with
 consistent hashing, replicated across nodes, and able to survive a node
 failure live without failing client requests.
 
-**Status:** Phase 12 done: LRU eviction (memory limit per node).
+**Status:** All 13 phases done: consistent hashing, replication, failure detection, failover, rebalancing, TTL, LRU eviction and quorum reads/writes.
 
 ## Why this project?
 
@@ -29,7 +29,7 @@ and rebalancing.
 - [x] Kubernetes (StatefulSet on a local kind cluster) deployment
 - [x] Live "kill a node" demo with zero failed requests (chaos test, also run in CI)
 - [x] Stretch: LRU eviction
-- [ ] Stretch: quorum reads/writes
+- [x] Stretch: quorum reads/writes
 
 ## Tech stack
 
@@ -265,6 +265,8 @@ RETRIES=0 npm run demo:client -- 10   # no retries: some requests fail
 | `FAILURE_THRESHOLD` | Failed pings in a row before a node counts as down | `3` |
 | `ANTI_ENTROPY_INTERVAL_MS` | How often a node compares notes with every peer | `5000` |
 | `MAX_ENTRIES` | Most live keys one node may hold. When full, the least recently used key is evicted. | `0` (no limit) |
+| `WRITE_QUORUM` | How many copies must confirm a write (1 to `REPLICATION_FACTOR`). Above 1 needs `REPLICATION_MODE=sync`. | `1` |
+| `READ_QUORUM` | How many copies are asked on a read (1 to `REPLICATION_FACTOR`). The newest version wins. | `1` |
 
 ## API
 
@@ -452,6 +454,30 @@ curl localhost:3000/stats   # { "keys": 0, "maxEntries": 3, "evictions": 0 }
 
 > Run the chaos demo **without** `MAX_ENTRIES`: an evicted key counts as lost.
 
+### Quorum reads and writes
+
+Replication keeps N copies of a key (`REPLICATION_FACTOR`). A **write quorum W** says how
+many copies must confirm a write; a **read quorum R** says how many copies a read asks.
+
+- **W + R > N** means any R nodes include at least one node that has the latest successful
+  write. Example: N=3, W=2, R=2.
+- **Write:** the node stores the key itself (1 ack), sends it to the other owners at the same
+  time, and answers as soon as W acks are in. Too few acks: `503` with `{ needed, got }`.
+- **Read:** asks all owners at once, takes the first R answers, returns the newest version
+  (`404` if the newest is a delete). Copies that were stale or empty are **repaired in the
+  background** (read repair).
+- **Default is W=1, R=1** (the old behaviour: fast, but a read may be stale).
+- **CAP in practice:** with W=2, R=2 a partitioned minority answers `503` instead of a
+  possibly old value (consistency over availability). With W=1, R=1 it always answers
+  (availability over consistency).
+
+```bash
+# 3 nodes, every key on all three, W=2, R=2
+docker compose -f docker-compose.yml -f docker-compose.quorum.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.quorum.yml stop node-b node-c
+curl -i -X PUT localhost:3001/keys/x -H "Content-Type: application/json" -d '{"value":1}'   # 503
+```
+
 ### Data lives in memory only
 
 Like Redis without persistence, a node that restarts comes back **empty**.
@@ -469,6 +495,9 @@ its peers refill it.
 | Digests list every key | Fine at this size; large systems use Merkle trees |
 | The limit counts keys, not bytes | A few huge values can still use a lot of memory. A byte-based limit needs size accounting. |
 | Full peers keep refusing repair | A full node refuses new keys from anti-entropy, so peers may re-send them every round (some wasted traffic, no data loss). |
+| A failed quorum write is not rolled back | The `503` means "not confirmed", but one node may still hold the value and anti-entropy can spread it. Undoing it needs a commit protocol (two-phase commit). |
+| Not linearizable | Versions are timestamps, so clocks that disagree can make "newest" wrong by a few milliseconds. |
+| Eviction can weaken a quorum | An LRU-evicted copy counts as missing, so a key can have fewer than W real copies. |
 
 ## Project structure
 
@@ -486,6 +515,7 @@ src/
   client.js             CacheClient: round robin and retries
   chaos.js              load generator, key verification and report for the chaos demo
   index.js              starts a node
+  quorum.js             # firstSuccesses (wait for N of M answers) and newestRecord
 scripts/
   ring-demo.js      prints how keys spread and move on the ring
   dev-cluster.js    starts several nodes locally; kill / start / freeze / thaw / join / leave
@@ -499,6 +529,7 @@ k8s/                StatefulSet, Services and PodDisruptionBudget
 Dockerfile          builds the node image (node:24-alpine)
 .dockerignore       files that stay out of the image
 docker-compose.yml  a 3-node cluster in containers
+docker-compose.quorum.yml # override: N=3, W=2, R=2
 ```
 
 ## Running tests
@@ -524,14 +555,11 @@ npm test
 | 10    | 3         | 140   |
 | 11    | 11        | 151   |
 | 12    | 16        | 167   |
+| 13    | 16        | 183   |
 
 ## Roadmap
 
-Each phase is delivered as one pull request. The core requirements are done.
-Phase 12 adds LRU eviction and Phase 13 adds quorum reads and writes (both
-stretch goals).
-
-Next: **Phase 13**, quorum reads/writes (the last stretch goal).
+All planned phases are done. Ideas for later: LFU eviction, a byte-size memory limit, hinted handoff (keep writes for a down node and replay them), and sloppy quorums.
 
 ## License
 
