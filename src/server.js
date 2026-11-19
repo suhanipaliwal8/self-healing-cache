@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { isNewer } from './store.js';
+import { firstSuccesses, newestRecord } from './quorum.js';
 
 // A request body arrives in small pieces (chunks). We collect them all.
 async function readBody(req) {
@@ -34,7 +36,15 @@ function tryOrder(owners) {
 // which takes over as "acting primary".
 export function createServer(
   store,
-  { cluster, forwardTimeoutMs = 2000, replicationFactor = 1, replicationMode = 'sync', rebalancer } = {},
+  {
+    cluster,
+    forwardTimeoutMs = 2000,
+    replicationFactor = 1,
+    replicationMode = 'sync',
+    writeQuorum = 1,
+    readQuorum = 1,
+    rebalancer,
+  } = {},
 ) {
   // Every write gets a VERSION: the time it happened, made to always go up on
   // this node. When two copies disagree, the higher version wins.
@@ -138,6 +148,78 @@ export function createServer(
     return sendJson(res, 502, { error: unreachableMessage(owners) });
   }
 
+  // ---------- quorum ----------
+
+  // Quorum failed: not enough nodes answered. 503 = "try again / try another node".
+  function quorumFailed(res, kind, needed, got) {
+    return sendJson(res, 503, { error: `${kind} quorum not reached`, needed, got });
+  }
+
+  // Quorum READ (READ_QUORUM > 1). Ask EVERY owner at the same time for its record
+  // (value + version), stop at the first R answers, and return the newest one.
+  // "I do not have it" is also an answer. Fewer than R answers = 503.
+  async function readWithQuorum(res, key, owners) {
+    const ask = (owner) => async () => {
+      if (owner.isSelf) {
+        store.getEntry(key); // a read counts as "use" for the LRU order
+        return { owner, record: store.getRecord(key) };
+      }
+      const result = await callNode(owner, 'POST', '/internal/fetch', JSON.stringify({ keys: [key] }));
+      if (result.status !== 200) throw new Error(`status ${result.status}`);
+      const [entry] = JSON.parse(result.text).entries;
+      if (entry === undefined) return { owner, record: undefined };
+      const record = { ...entry };
+      delete record.key;
+      return { owner, record };
+    };
+
+    const { successes } = await firstSuccesses(owners.map(ask), readQuorum);
+    if (successes.length < readQuorum) {
+      return quorumFailed(res, 'read', readQuorum, successes.length);
+    }
+
+    const newest = newestRecord(successes.map((answer) => answer.record));
+    if (newest !== undefined) repairStale(key, newest, successes);
+    if (newest === undefined || newest.deleted) {
+      return sendJson(res, 404, { error: 'key not found' });
+    }
+    const body = { key, value: newest.value };
+    if (newest.expiresAt !== null) body.expiresAt = newest.expiresAt;
+    return sendJson(res, 200, body);
+  }
+
+  // READ REPAIR: whoever answered with an older copy (or none) gets the newest
+  // record, in the background. The reader does not wait for this.
+  function repairStale(key, newest, answers) {
+    const entry = { key, ...newest };
+    for (const { owner, record } of answers) {
+      if (record !== undefined && !isNewer(newest, record)) continue; // already up to date
+      if (owner.isSelf) {
+        store.applyRecord(key, newest, { evict: false });
+      } else {
+        callNode(owner, 'POST', '/internal/entries', JSON.stringify({ entries: [entry] })).catch(() => {});
+      }
+    }
+  }
+
+  // Quorum WRITE (WRITE_QUORUM > 1). Our own copy is ack number 1. We send the change
+  // to every other owner at the same time (also those we suspect are down; no waiting
+  // for them if enough others answer) and stop as soon as W acks are in.
+  async function replicateToQuorum(key, method, payload) {
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
+    const { successes } = await firstSuccesses(
+      replicaTargets(key).map((node) => async () => {
+        const result = await callNode(node, method, internalPath(key), body);
+        if (result.status !== 200) throw new Error(`status ${result.status}`);
+        return node.id;
+      }),
+      writeQuorum - 1,
+    );
+    return { acked: successes, total: 1 + successes.length };
+  }
+
+  const ackHeader = (acked) => (acked.length > 0 ? { 'x-replicated-to': acked.join(',') } : {});
+
   // ---------- writes ----------
 
   // The other nodes that should hold a copy of this key (empty if we are not
@@ -191,21 +273,32 @@ export function createServer(
     // Replicas receive the ABSOLUTE expiry time, so the key dies at the same
     // moment on every copy, and the VERSION, so every copy knows which write is newest.
     const record = store.getRecord(key);
-    const headers = record
-      ? await replicate(
-          key,
-          'PUT',
-          { value: record.value, expiresAt: record.expiresAt, version: record.version, writer },
-          unreachable,
-        )
-      : {};
+    let headers = {};
+    if (record) {
+      const payload = { value: record.value, expiresAt: record.expiresAt, version: record.version, writer };
+      if (writeQuorum > 1) {
+        const { acked, total } = await replicateToQuorum(key, 'PUT', payload);
+        if (total < writeQuorum) return quorumFailed(res, 'write', writeQuorum, total);
+        headers = ackHeader(acked);
+      } else {
+        headers = await replicate(key, 'PUT', payload, unreachable);
+      }
+    }
     return sendJson(res, 200, { ok: true }, { ...extraHeaders, ...headers });
   }
 
   async function applyDelete(res, key, extraHeaders = {}, unreachable = new Set()) {
     const version = nextVersion();
     const deleted = store.delete(key, { version, writer });
-    const headers = await replicate(key, 'DELETE', { version, writer }, unreachable);
+    const payload = { version, writer };
+    let headers;
+    if (writeQuorum > 1) {
+      const { acked, total } = await replicateToQuorum(key, 'DELETE', payload);
+      if (total < writeQuorum) return quorumFailed(res, 'write', writeQuorum, total);
+      headers = ackHeader(acked);
+    } else {
+      headers = await replicate(key, 'DELETE', payload, unreachable);
+    }
     return sendJson(res, 200, { deleted }, { ...extraHeaders, ...headers });
   }
 
@@ -413,6 +506,7 @@ export function createServer(
 
       if (req.method === 'GET') {
         if (owners.length === 0) return readLocal(res, key);
+        if (readQuorum > 1) return readWithQuorum(res, key, owners);
         return readFromOwners(res, key, owners);
       }
 
